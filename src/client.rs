@@ -139,12 +139,17 @@ impl Drop for TunnelClient {
     }
 }
 
-fn quic_config() -> Result<quinn::ClientConfig, Error> {
+fn root_store() -> Result<rustls::RootCertStore, Error> {
     let mut roots = rustls::RootCertStore::empty();
     for cert in CertificateDer::pem_slice_iter(ROOTS) {
         let cert = cert.map_err(|e| Error::Tls(e.to_string()))?;
         roots.add(cert).map_err(|e| Error::Tls(e.to_string()))?;
     }
+    Ok(roots)
+}
+
+fn quic_config() -> Result<quinn::ClientConfig, Error> {
+    let roots = root_store()?;
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let mut tls = rustls::ClientConfig::builder_with_provider(provider)
         .with_protocol_versions(&[&rustls::version::TLS13])
@@ -228,5 +233,13 @@ async fn register(
                 should_retry: error.get_should_retry(),
             })
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn loads_every_bundled_root() {
+        assert_eq!(super::root_store().unwrap().len(), 3);
     }
 }
