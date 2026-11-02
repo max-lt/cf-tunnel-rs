@@ -1,10 +1,10 @@
 # cf-tunnel-rs
 
 A Rust client for Cloudflare Tunnel. It connects to the Cloudflare edge over QUIC.
-It is a library first. It has no Go code and does not need `cloudflared`.
+It is a library first.
 
-This project is not affiliated with Cloudflare. The edge protocol is not
-published as stable. [PROTOCOL.md](PROTOCOL.md) describes what this crate uses.
+This project is not affiliated with Cloudflare. Cloudflare can change the edge
+protocol without notice. [PROTOCOL.md](PROTOCOL.md) describes what this crate uses.
 
 ## Quick start
 
@@ -21,7 +21,7 @@ let app = Router::new().route("/", get(|| async { "Hello" }));
 Tunnel::start(TunnelConfig::new(token)).await?.serve(app).await?;
 ```
 
-This needs the `http` feature. `serve` accepts any `tower` service, not only axum.
+This needs the `http` feature. `serve` accepts a `tower` service.
 
 Run the complete example:
 
@@ -29,7 +29,7 @@ Run the complete example:
 TUNNEL_TOKEN=<token> cargo run --features http --example hello
 ```
 
-## Without the `http` feature
+## Request streams
 
 `Tunnel::accept()` returns one request stream at a time:
 
@@ -42,7 +42,7 @@ loop {
 }
 ```
 
-The edge sends the method, the URL and the headers as metadata, not as HTTP bytes.
+The edge sends the method, the URL and the headers as metadata entries.
 `ConnectRequest` gives access to them.
 
 ## What it does
@@ -82,12 +82,12 @@ background after a network failure, so wrap it in a timeout if you cannot wait.
 ## Build and test
 
 You need Rust 1.85 or later and a C compiler. The TLS library `ring` compiles
-some C code. The crate does not need the `capnp` compiler.
+some C code.
 
 The Cap'n Proto wire format is read and written by `src/wire.rs`. `cargo test`
 compares that code with the reference `capnp` tool when the tool is on the PATH,
 for example after `brew install capnp`. The tests use the schemas in
-`tests/schema`. Without the tool, those tests skip.
+`tests/schema`. Those tests skip when the tool is missing.
 
 ## License
 
