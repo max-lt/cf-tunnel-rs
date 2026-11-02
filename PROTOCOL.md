@@ -240,6 +240,13 @@ Rules:
   metadata is `FlowConnectRateLimited`.
 - For tcp, the client sends an empty `ConnectResponse` to accept. Bytes flow in
   both directions after that.
+- For websocket, the request metadata holds `HttpHeader:Sec-Websocket-Key` and
+  `HttpHeader:Sec-Websocket-Version`. The client accepts with `HttpStatus` 101
+  and `HttpHeader:Sec-WebSocket-Accept`. The accept value is the SHA-1 of the
+  key and the RFC 6455 GUID, in base64. After that, the stream carries
+  WebSocket frames. The edge sends masked frames and expects unmasked frames.
+- A request over HTTP/2 that asks for an upgrade reaches the client as
+  an `http` request, without the `Upgrade` and `Connection` headers.
 - Trailers are not supported.
 - A request with no `Content-Length`, no chunked encoding and a non-websocket
   type has no body. The client closes its read side.

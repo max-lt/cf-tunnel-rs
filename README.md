@@ -37,7 +37,8 @@ async fn main() -> anyhow::Result<()> {
 }
 ```
 
-This needs the `http` feature. `serve` accepts a `tower` service.
+This needs the `http` feature. `serve` accepts a `tower` service. It also
+upgrades WebSocket requests, so an axum `WebSocketUpgrade` route works.
 
 ```
 TUNNEL_TOKEN=<token> cargo run --features http --example hello
@@ -77,7 +78,7 @@ background after a network failure, so wrap it in a timeout if you cannot wait.
 
 ## Limits
 
-- WebSocket, TCP and UDP streams are refused. The edge sends them, but nothing
+- TCP and UDP streams are refused. The edge sends them, but nothing
   handles them yet.
 - The edge sends its ingress configuration over RPC. The crate ignores it.
   Your code chooses what answers each request.
@@ -92,6 +93,7 @@ background after a network failure, so wrap it in a timeout if you cannot wait.
 | --- | --- |
 | `hello` | Serves an axum app. Needs `--features http`. |
 | `relay` | Forwards HTTP requests to a local port. Set `ORIGIN=host:port`. |
+| `chat` | Serves a WebSocket chat room. Needs `--features http`. |
 
 ## Build and test
 

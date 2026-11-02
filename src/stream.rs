@@ -228,12 +228,20 @@ pub(crate) fn response_bytes(error: Option<&str>, metadata: &[(&str, &str)]) -> 
     out
 }
 
-/// What the edge writes at the start of an http request stream, for tests.
+/// What the edge writes at the start of a request stream, for tests.
 #[cfg(test)]
-pub(crate) fn request_bytes(dest: &str, metadata: &[(&str, &str)]) -> Vec<u8> {
+pub(crate) fn request_bytes(kind: StreamKind, dest: &str, metadata: &[(&str, &str)]) -> Vec<u8> {
     let mut b = Builder::new();
     let root = b.init_root(1, 2);
-    b.set_u16(root, 0, HTTP);
+    b.set_u16(
+        root,
+        0,
+        match kind {
+            StreamKind::Http => HTTP,
+            StreamKind::WebSocket => WEBSOCKET,
+            StreamKind::Tcp => TCP,
+        },
+    );
     b.set_text(root.slot(0), dest);
 
     let list = b.init_struct_list(root.slot(1), metadata.len(), 0, 2);

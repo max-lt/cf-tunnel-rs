@@ -3,7 +3,10 @@
 //!
 //! The edge sends the method, the URL and the headers as metadata, not as HTTP
 //! bytes. This module builds an [`http::Request`] from them, calls the service,
-//! and writes the response back. WebSocket and TCP streams are refused.
+//! and writes the response back. A WebSocket request goes through hyper, so
+//! the service can upgrade it. TCP streams are refused.
+
+mod websocket;
 
 use std::{
     future::poll_fn,
@@ -31,14 +34,22 @@ const HOP_HEADERS: [&str; 3] = ["connection", "keep-alive", "transfer-encoding"]
 
 /// The body of a request, read from its stream.
 pub struct Body<R = RecvStream> {
-    reader: R,
+    /// `None` for a body with no data.
+    reader: Option<R>,
     chunk: BytesMut,
 }
 
 impl<R> Body<R> {
     fn new(reader: R) -> Self {
         Self {
-            reader,
+            reader: Some(reader),
+            chunk: BytesMut::new(),
+        }
+    }
+
+    fn empty() -> Self {
+        Self {
+            reader: None,
             chunk: BytesMut::new(),
         }
     }
@@ -53,9 +64,15 @@ impl<R: AsyncRead + Unpin> HttpBody for Body<R> {
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<Bytes>, io::Error>>> {
         let this = &mut *self;
+
+        // A body with no data is complete at once.
+        let Some(reader) = this.reader.as_mut() else {
+            return Poll::Ready(None);
+        };
+
         this.chunk.reserve(READ_CHUNK);
 
-        match poll_read_buf(Pin::new(&mut this.reader), cx, &mut this.chunk) {
+        match poll_read_buf(Pin::new(reader), cx, &mut this.chunk) {
             Poll::Pending => Poll::Pending,
             Poll::Ready(Err(error)) => Poll::Ready(Some(Err(error))),
 
@@ -96,12 +113,20 @@ impl Tunnel {
 /// Answers one request stream with `service`.
 async fn serve_stream<S, B>(stream: IncomingStream, mut service: S)
 where
-    S: Service<Request<Body>, Response = Response<B>>,
-    S::Error: Into<BoxError>,
-    B: HttpBody<Data = Bytes>,
-    B::Error: Into<BoxError>,
+    S: Service<Request<Body>, Response = Response<B>> + Clone + Send + 'static,
+    S::Error: Into<BoxError> + Send,
+    S::Future: Send,
+    B: HttpBody<Data = Bytes> + Send + 'static,
+    B::Error: Into<BoxError> + Send,
 {
     let (request, recv, responder) = stream.split();
+
+    // A WebSocket needs hyper, because services read the upgrade from it.
+    if request.kind == StreamKind::WebSocket {
+        websocket::serve(request, recv, responder, service).await;
+
+        return;
+    }
 
     if request.kind != StreamKind::Http {
         let _ = responder.reject("only http is supported").await;
@@ -144,6 +169,11 @@ where
 
 /// Builds the request: origin-form URL, headers, and the body stream.
 fn build_request<R>(request: &ConnectRequest, reader: R) -> Result<Request<Body<R>>, http::Error> {
+    request_builder(request)?.body(Body::new(reader))
+}
+
+/// The method, the origin-form URL and the headers of a request.
+fn request_builder(request: &ConnectRequest) -> Result<http::request::Builder, http::Error> {
     let method = Method::from_bytes(request.http_method().unwrap_or("GET").as_bytes())?;
 
     let mut builder = Request::builder()
@@ -164,7 +194,7 @@ fn build_request<R>(request: &ConnectRequest, reader: R) -> Result<Request<Body<
         builder = builder.header(header::HOST, host);
     }
 
-    builder.body(Body::new(reader))
+    Ok(builder)
 }
 
 /// Writes the response head, then its body. A `HEAD` response has no body.

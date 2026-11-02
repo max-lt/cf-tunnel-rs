@@ -1,0 +1,25 @@
+<!doctype html>
+<title>chat</title>
+<pre id="log" style="height: 60vh; overflow: auto"></pre>
+<form id="form">
+  <input id="text" autocomplete="off" autofocus>
+  <button>send</button>
+</form>
+<script>
+  const log = document.getElementById("log");
+  const text = document.getElementById("text");
+  const scheme = location.protocol === "https:" ? "wss://" : "ws://";
+  const ws = new WebSocket(scheme + location.host + "/ws");
+
+  ws.onmessage = (event) => {
+    log.textContent += event.data + "\n";
+    log.scrollTop = log.scrollHeight;
+  };
+  ws.onclose = () => { log.textContent += "-- closed --\n"; };
+
+  document.getElementById("form").onsubmit = (event) => {
+    event.preventDefault();
+    if (text.value) ws.send(text.value);
+    text.value = "";
+  };
+</script>

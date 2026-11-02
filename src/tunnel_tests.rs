@@ -14,7 +14,7 @@ use tokio::sync::watch;
 use uuid::Uuid;
 
 use crate::{
-    ConnectRequest, ConnectionStatus, EdgeSource, Error, Token, Tunnel, TunnelConfig,
+    ConnectRequest, ConnectionStatus, EdgeSource, Error, StreamKind, Token, Tunnel, TunnelConfig,
     proto::fake_edge, stream::request_bytes, wire,
 };
 
@@ -185,38 +185,54 @@ impl EdgeConnection {
         self.conn.close(0u32.into(), b"unregistered");
     }
 
-    /// Opens a request stream as the edge does, and reads the whole response.
-    async fn request(&self, dest: &str, metadata: &[(&str, &str)]) -> Response {
-        let (mut send, mut recv) = self.conn.open_bi().await.expect("request stream");
-        send.write_all(&request_bytes(dest, metadata))
+    /// Opens a request stream as the edge does and writes the request.
+    async fn start(
+        &self,
+        kind: StreamKind,
+        dest: &str,
+        metadata: &[(&str, &str)],
+    ) -> (SendStream, RecvStream) {
+        let (mut send, recv) = self.conn.open_bi().await.expect("request stream");
+        send.write_all(&request_bytes(kind, dest, metadata))
             .await
             .unwrap();
+
+        (send, recv)
+    }
+
+    /// Opens an http request stream and reads the whole response.
+    async fn request(&self, dest: &str, metadata: &[(&str, &str)]) -> Response {
+        let (mut send, mut recv) = self.start(StreamKind::Http, dest, metadata).await;
         send.finish().unwrap();
 
-        let mut preamble = [0u8; PREAMBLE_LEN];
-        recv.read_exact(&mut preamble)
-            .await
-            .expect("response preamble");
-
-        let head = wire::read_message(&mut recv).await.expect("response head");
-        let root = head.root().unwrap();
-        let metadata = root
-            .struct_list(1)
-            .unwrap()
-            .iter()
-            .map(|entry| {
-                (
-                    entry.text(0).unwrap().to_owned(),
-                    entry.text(1).unwrap().to_owned(),
-                )
-            })
-            .collect();
-
         Response {
-            metadata,
+            metadata: read_head(&mut recv).await,
             body: recv.read_to_end(1 << 20).await.expect("response body"),
         }
     }
+}
+
+/// Reads the preamble and the metadata of a response.
+async fn read_head(recv: &mut RecvStream) -> Vec<(String, String)> {
+    let mut preamble = [0u8; PREAMBLE_LEN];
+    recv.read_exact(&mut preamble)
+        .await
+        .expect("response preamble");
+
+    let head = wire::read_message(recv).await.expect("response head");
+
+    head.root()
+        .unwrap()
+        .struct_list(1)
+        .unwrap()
+        .iter()
+        .map(|entry| {
+            (
+                entry.text(0).unwrap().to_owned(),
+                entry.text(1).unwrap().to_owned(),
+            )
+        })
+        .collect()
 }
 
 struct Response {
@@ -395,4 +411,143 @@ async fn shutdown_unregisters_and_stops() {
     // The edge closed the connection, so the grace period did not run out.
     assert!(started.elapsed() < Duration::from_secs(2));
     assert!(matches!(status.borrow()[0], ConnectionStatus::Stopped));
+}
+
+/// Headers the edge forwards for a browser that opens a WebSocket.
+#[cfg(feature = "http")]
+const WEBSOCKET_HEADERS: &[(&str, &str)] = &[
+    ("HttpMethod", "GET"),
+    ("HttpHeader:Sec-Websocket-Key", "dGhlIHNhbXBsZSBub25jZQ=="),
+    ("HttpHeader:Sec-Websocket-Version", "13"),
+];
+
+/// An app that sends every WebSocket message back.
+#[cfg(feature = "http")]
+fn echo_app() -> axum::Router {
+    use axum::{
+        extract::ws::{Message, WebSocketUpgrade},
+        routing::get,
+    };
+
+    let echo = |upgrade: WebSocketUpgrade| async {
+        upgrade.on_upgrade(|mut socket| async move {
+            while let Some(Ok(message)) = socket.recv().await {
+                // After a close frame, `recv` sends the reply and then returns `None`.
+                if matches!(message, Message::Close(_)) {
+                    continue;
+                }
+
+                if socket.send(message).await.is_err() {
+                    break;
+                }
+            }
+        })
+    };
+
+    axum::Router::new().route("/ws", get(echo))
+}
+
+/// A frame as a browser sends it: masked, with a payload under 126 bytes.
+#[cfg(feature = "http")]
+fn browser_frame(opcode: u8, payload: &[u8]) -> Vec<u8> {
+    const MASK: [u8; 4] = [1, 2, 3, 4];
+
+    let mut frame = vec![0x80 | opcode, 0x80 | payload.len() as u8];
+    frame.extend_from_slice(&MASK);
+    frame.extend(
+        payload
+            .iter()
+            .zip(MASK.iter().cycle())
+            .map(|(byte, key)| byte ^ key),
+    );
+
+    frame
+}
+
+#[cfg(feature = "http")]
+#[tokio::test]
+async fn upgrades_a_websocket_through_the_service() {
+    const TEXT: u8 = 0x1;
+    const CLOSE: u8 = 0x8;
+
+    let edge = FakeEdge::start();
+    let (tunnel, conn, _) = connected(&edge).await;
+
+    let browser = async {
+        let (mut send, mut recv) = conn
+            .start(StreamKind::WebSocket, "https://h/ws", WEBSOCKET_HEADERS)
+            .await;
+        let head = Response {
+            metadata: read_head(&mut recv).await,
+            body: Vec::new(),
+        };
+
+        assert_eq!(head.find("HttpStatus"), Some("101"));
+
+        // The example key of RFC 6455 gives this accept value.
+        assert_eq!(
+            head.find("HttpHeader:sec-websocket-accept"),
+            Some("s3pPLMBiTxaQ9kYGzzhZRbK+xOo=")
+        );
+
+        // A text frame comes back unchanged and without a mask.
+        send.write_all(&browser_frame(TEXT, b"ping")).await.unwrap();
+
+        let mut echo = [0u8; 6];
+        recv.read_exact(&mut echo).await.unwrap();
+
+        assert_eq!(echo, [0x80 | TEXT, 4, b'p', b'i', b'n', b'g']);
+
+        // A close frame gets a close frame back, and then the stream ends.
+        send.write_all(&browser_frame(CLOSE, &[])).await.unwrap();
+
+        let mut close = [0u8; 2];
+        recv.read_exact(&mut close).await.unwrap();
+
+        assert_eq!(close, [0x80 | CLOSE, 0]);
+
+        send.finish().unwrap();
+
+        assert!(recv.read_to_end(16).await.unwrap().is_empty());
+    };
+
+    within("websocket", async {
+        tokio::select! {
+            served = tunnel.serve(echo_app()) => panic!("serve ended: {served:?}"),
+            () = browser => {}
+        }
+    })
+    .await;
+}
+
+#[cfg(feature = "http")]
+#[tokio::test]
+async fn a_refused_upgrade_returns_the_status_of_the_service() {
+    let edge = FakeEdge::start();
+    let (tunnel, conn, _) = connected(&edge).await;
+
+    let browser = async {
+        let (_send, mut recv) = conn
+            .start(
+                StreamKind::WebSocket,
+                "https://h/missing",
+                WEBSOCKET_HEADERS,
+            )
+            .await;
+        let head = Response {
+            metadata: read_head(&mut recv).await,
+            body: recv.read_to_end(1 << 16).await.unwrap(),
+        };
+
+        assert_eq!(head.find("HttpStatus"), Some("404"));
+        assert!(head.body.is_empty());
+    };
+
+    within("refusal", async {
+        tokio::select! {
+            served = tunnel.serve(echo_app()) => panic!("serve ended: {served:?}"),
+            () = browser => {}
+        }
+    })
+    .await;
 }
