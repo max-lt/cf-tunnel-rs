@@ -8,17 +8,39 @@ description = "Client library for Cloudflare Tunnel over QUIC"
 
 [dependencies]
 base64 = "0.23.1"
+bytes = { version = "1.12.1", optional = true }
 hickory-resolver = { version = "0.26", features = ["tls-ring", "webpki-roots"] }
+http = { version = "1.5.0", optional = true }
+http-body = { version = "1.1.0", optional = true }
+http-body-util = { version = "0.1.5", optional = true }
 quinn = "0.11"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 thiserror = "2.0.21"
 tokio = { version = "1", features = ["rt", "time", "sync", "io-util", "macros"] }
+tokio-util = { version = "0.7.20", features = ["io"], optional = true }
+tower-service = { version = "0.3.3", optional = true }
 tracing = "0.1.44"
 uuid = { version = "1.29.0", features = ["v4", "serde"] }
 
 [dev-dependencies]
 anyhow = "1.0.104"
+axum = { version = "0.8.9", default-features = false }
 httparse = "1.10.1"
-tokio = { version = "1", features = ["macros", "net", "signal", "io-util"] }
+tokio = { version = "1", features = ["macros", "net", "signal", "io-util", "rt-multi-thread"] }
+
+[features]
+# Serves requests with a `tower` service, for example an axum `Router`.
+http = [
+    "dep:bytes",
+    "dep:http",
+    "dep:http-body",
+    "dep:http-body-util",
+    "dep:tokio-util",
+    "dep:tower-service",
+]
+
+[[example]]
+name = "hello"
+required-features = ["http"]

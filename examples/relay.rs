@@ -1,5 +1,5 @@
 //! Keep connections to the edge and relay HTTP requests to ORIGIN.
-//! Usage: set -a; . ./.env; set +a; cargo run --example serve
+//! Usage: set -a; . ./.env; set +a; cargo run --example relay
 //! Optional: EDGE_ADDRS=<ip>:7844,... skips discovery; CONNECTIONS=<n>; ORIGIN=<host:port>.
 
 use std::{net::SocketAddr, sync::Arc, time::Duration};

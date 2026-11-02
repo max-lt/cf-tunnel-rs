@@ -3,9 +3,19 @@
 A Rust client for Cloudflare Tunnel. It talks to the Cloudflare edge over QUIC.
 It is a library first. It contains no Go code.
 
+With the `http` feature, any `tower` service answers the tunnel, for example an
+axum `Router`:
+
 ```rust
-let config = TunnelConfig::new(token);
-let tunnel = Tunnel::start(config).await?;
+let app = Router::new().route("/", get(|| async { "Hello" }));
+
+Tunnel::start(TunnelConfig::new(token)).await?.serve(app).await?;
+```
+
+Without it, `Tunnel::accept()` hands out each request stream:
+
+```rust
+let tunnel = Tunnel::start(TunnelConfig::new(token)).await?;
 
 loop {
     let (request, body, responder) = tunnel.accept().await?.split();
@@ -17,7 +27,8 @@ loop {
 with a backoff. `TunnelClient` is one connection, for callers that want to
 manage their own set.
 
-`examples/serve.rs` relays HTTP to a local port. See [PROTOCOL.md](PROTOCOL.md)
+Examples: `hello` serves an axum app (`cargo run --features http --example
+hello`). `relay` forwards HTTP to a local port. See [PROTOCOL.md](PROTOCOL.md)
 for the wire protocol.
 
 Status: early. WebSocket, TCP and UDP streams are not handled yet, and the

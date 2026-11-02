@@ -22,6 +22,8 @@ mod client;
 mod control;
 mod edge;
 mod error;
+#[cfg(feature = "http")]
+pub mod http;
 #[cfg(test)]
 mod interop_tests;
 mod proto;
