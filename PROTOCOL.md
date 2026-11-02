@@ -144,6 +144,17 @@ a remotely managed tunnel:
 - `unregisterConnection` gets no RPC reply. The edge closes the QUIC
   connection with application error code 0.
 
+Tested with `examples/serve.rs` and a published application
+(`cf-tunnel-rs.lechat.dev`, service URL `http://localhost:3000`):
+
+- The edge opens one data stream per HTTP request. GET and POST (50 KB body)
+  return the same status and body as the origin.
+- The client can read the request body before it sends the response. An
+  origin that waits for the body needs this.
+- The edge sent no RPC stream during the test. The client ignores RPC streams.
+- The edge picks the connection for each request. The client does not route.
+- The `dest` field holds the public URL. The client picks the origin itself.
+
 ## 6. Streams opened by the edge
 
 Every stream starts with a 6-byte signature
