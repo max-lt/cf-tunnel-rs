@@ -21,6 +21,12 @@ client to deliver requests. The client never listens on a public port.
   Cloudflare Origin CA roots (`tlsconfig/cloudflare_ca.go`).
 - An HTTP/2 transport exists (server name `h2.cftunnel.com`). It is out of scope.
 
+Key exchange (`crypto/curves.go`). The default mode offers these groups in
+order: `X25519MLKEM768`, `P256Kyber768Draft00` (`0xfe32`), `secp256r1`. The
+classical group is a fallback, so a post-quantum exchange is not required.
+Strict mode drops `secp256r1`. Only the `--post-quantum` flag enables strict
+mode.
+
 QUIC parameters (`quic/constants.go`, `connection/quic_config.go`):
 
 | Parameter | Value |
@@ -46,7 +52,8 @@ Source: `edgediscovery/allregions/discovery.go`.
 
 ## 4. Credentials
 
-A tunnel token is a JSON object (`connection/connection.go`):
+A tunnel token string is standard base64 of a JSON object
+(`connection/connection.go`). The JSON keys are:
 
 | Key | Type | Meaning |
 | --- | --- | --- |
@@ -84,7 +91,8 @@ Schema: `tunnelrpc/proto/tunnelrpc.capnp`. Interface `RegistrationServer`
 `ConnectionResponse` is a union: `ConnectionError` or `ConnectionDetails`.
 
 - `ConnectionError`: `cause: Text`, `retryAfter: Int64` (nanoseconds),
-  `shouldRetry: Bool`.
+  `shouldRetry: Bool`. The cause `EDUPCONN` means a duplicate connection for
+  this `connIndex`.
 - `ConnectionDetails`: `uuid: Data`, `locationName: Text` (colo code),
   `tunnelIsRemotelyManaged: Bool`.
 
@@ -108,15 +116,20 @@ the grace period for the reply.
 
 ### 5.2 Feature strings
 
-From `features/features.go`:
+From `features/features.go` and `features/selector.go`:
 
-- `support_datagram_v2`
-- `support_datagram_v3_2`
-- `postquantum`
+- `support_datagram_v3_2`: the client sends it to select datagram v3.
+- `support_datagram_v2`: a user can pass it. The client sends no string by
+  default, and the edge then uses datagram v2.
+- `postquantum`: the client sends it only in strict mode.
 
 The client removes deprecated strings (`serialized_headers`, `quick_reconnects`,
 `allow_remote_config`, `support_quic_eof`, `management_logs`,
 `support_datagram_v3`, `support_datagram_v3_1`) before it sends the list.
+
+`cloudflared` picks the datagram version from a user flag first. Otherwise it
+reads a percentage from the TXT record `cfd-features.argotunnel.com` (a JSON
+object, refreshed on a timer). The same record has a `SkipPrechecks` switch.
 
 ## 6. Streams opened by the edge
 
@@ -194,7 +207,8 @@ The client closes the stream after a response timeout.
 
 ## 7. Datagrams
 
-Two versions exist. The client picks one with a feature string.
+Two versions exist. Version 2 is the default. Section 5.2 shows how the client
+selects version 3.
 
 ### 7.1 Version 3 (`support_datagram_v3_2`)
 
@@ -232,17 +246,24 @@ unreachable, `0x02` unable to bind socket, `0x03` too many active flows,
 Source: `quic/datagramv2.go`, `quic/datagram.go`. The client appends metadata
 to the end of the payload. Session registration uses the RPC in section 6.2.
 
-The type byte is the last byte. Values: `0` UDP payload, `1` IP packet,
+The type is the last byte. Values: `0` UDP payload, `1` IP packet,
 `2` IP packet with trace ID, `3` tracing spans (protobuf).
+
+| Type | Layout |
+| --- | --- |
+| UDP payload | payload, session UUID (16 bytes), type (1 byte) |
+| IP packet | packet, type (1 byte) |
+| IP packet with trace | packet, trace ID, type (1 byte) |
+
+Size limits: the maximum datagram frame is 1350 bytes on unix and 1220 bytes
+on Windows. The maximum UDP payload is 1280 bytes on unix.
 
 ## 8. Not read
 
 - Region selection (`edgediscovery/allregions/region.go`, `regions.go`).
-- The value of `DuplicateConnectionError`.
-- The encoding of the token string (`TunnelToken.Encode`).
 - ICMP datagrams (`quic/v3/icmp.go`).
-- The exact byte order of the version 2 suffix.
+- The trace ID length in version 2 IP packets with trace.
+- The JSON key names of the `cfd-features.argotunnel.com` record.
 - Retry and backoff policy (`supervisor/`).
-- What the `postquantum` feature changes in the TLS handshake.
 - Why `go.mod` replaces `quic-go` with a fork (`chungthuang/quic-go`).
 - Whether `capnp-rpc` (Rust) interoperates with the Go RPC library.
