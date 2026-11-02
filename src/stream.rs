@@ -228,6 +228,30 @@ pub(crate) fn response_bytes(error: Option<&str>, metadata: &[(&str, &str)]) -> 
     out
 }
 
+/// What the edge writes at the start of an http request stream, for tests.
+#[cfg(test)]
+pub(crate) fn request_bytes(dest: &str, metadata: &[(&str, &str)]) -> Vec<u8> {
+    let mut b = Builder::new();
+    let root = b.init_root(1, 2);
+    b.set_u16(root, 0, HTTP);
+    b.set_text(root.slot(0), dest);
+
+    let list = b.init_struct_list(root.slot(1), metadata.len(), 0, 2);
+
+    for (i, (key, val)) in metadata.iter().enumerate() {
+        b.set_text(list.get(i).slot(0), key);
+        b.set_text(list.get(i).slot(1), val);
+    }
+
+    let message = b.finish();
+    let mut out = Vec::new();
+    out.extend_from_slice(&DATA_SIGNATURE);
+    out.extend_from_slice(&VERSION);
+    out.extend_from_slice(&message);
+
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

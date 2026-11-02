@@ -44,6 +44,9 @@ pub struct TunnelConfig {
     pub client_id: Uuid,
     /// Reported to the edge as the client version.
     pub version: String,
+    /// Trusted in place of the Cloudflare roots, so a test can run a fake edge.
+    #[cfg(test)]
+    pub(crate) roots: Option<rustls::RootCertStore>,
 }
 
 impl TunnelConfig {
@@ -57,6 +60,8 @@ impl TunnelConfig {
             edge: EdgeSource::Discover,
             client_id: base.client_id,
             version: base.version,
+            #[cfg(test)]
+            roots: None,
         }
     }
 }
@@ -122,6 +127,10 @@ impl Shared {
         config.conn_index = index as u8;
         config.client_id = self.config.client_id;
         config.version = self.config.version.clone();
+        #[cfg(test)]
+        {
+            config.roots = self.config.roots.clone();
+        }
 
         config
     }

@@ -34,6 +34,9 @@ pub struct ClientConfig {
     pub client_id: Uuid,
     /// Reported to the edge as the client version.
     pub version: String,
+    /// Trusted in place of the Cloudflare roots, so a test can run a fake edge.
+    #[cfg(test)]
+    pub(crate) roots: Option<rustls::RootCertStore>,
 }
 
 impl ClientConfig {
@@ -44,7 +47,18 @@ impl ClientConfig {
             conn_index: 0,
             client_id: Uuid::new_v4(),
             version: concat!("cf-tunnel-rs-", env!("CARGO_PKG_VERSION")).to_owned(),
+            #[cfg(test)]
+            roots: None,
         }
+    }
+
+    fn trusted_roots(&self) -> Result<rustls::RootCertStore, Error> {
+        #[cfg(test)]
+        if let Some(roots) = &self.roots {
+            return Ok(roots.clone());
+        }
+
+        root_store()
     }
 }
 
@@ -76,7 +90,7 @@ impl Session {
         };
 
         let mut endpoint = quinn::Endpoint::client(bind)?;
-        endpoint.set_default_client_config(quic_config()?);
+        endpoint.set_default_client_config(quic_config(&config)?);
         let conn = endpoint.connect(config.edge, SERVER_NAME)?.await?;
 
         // The edge treats the first stream as the control stream.
@@ -219,13 +233,13 @@ fn root_store() -> Result<rustls::RootCertStore, Error> {
     Ok(roots)
 }
 
-fn quic_config() -> Result<quinn::ClientConfig, Error> {
+fn quic_config(config: &ClientConfig) -> Result<quinn::ClientConfig, Error> {
     // TLS 1.3 against the Cloudflare roots only, with the edge's ALPN.
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let mut tls = rustls::ClientConfig::builder_with_provider(provider)
         .with_protocol_versions(&[&rustls::version::TLS13])
         .map_err(|e| Error::Tls(e.to_string()))?
-        .with_root_certificates(root_store()?)
+        .with_root_certificates(config.trusted_roots()?)
         .with_no_client_auth();
     tls.alpn_protocols = vec![ALPN.to_vec()];
 
@@ -243,10 +257,10 @@ fn quic_config() -> Result<quinn::ClientConfig, Error> {
 
     let crypto = quinn::crypto::rustls::QuicClientConfig::try_from(tls)
         .map_err(|e| Error::Tls(e.to_string()))?;
-    let mut config = quinn::ClientConfig::new(Arc::new(crypto));
-    config.transport_config(Arc::new(transport));
+    let mut quic = quinn::ClientConfig::new(Arc::new(crypto));
+    quic.transport_config(Arc::new(transport));
 
-    Ok(config)
+    Ok(quic)
 }
 
 #[cfg(test)]

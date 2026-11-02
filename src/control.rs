@@ -121,16 +121,7 @@ mod tests {
     type Pipe = tokio::io::DuplexStream;
 
     fn config() -> ClientConfig {
-        use base64::{Engine, engine::general_purpose::STANDARD};
-
-        let json = format!(
-            r#"{{"a":"acct","s":"{}","t":"{}"}}"#,
-            STANDARD.encode(b"secret"),
-            Uuid::new_v4()
-        );
-        let token: Token = STANDARD.encode(json).parse().unwrap();
-
-        ClientConfig::new(token, ([127, 0, 0, 1], 7844).into())
+        ClientConfig::new(Token::sample(), ([127, 0, 0, 1], 7844).into())
     }
 
     /// The edge's end of the control stream.

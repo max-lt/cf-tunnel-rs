@@ -27,6 +27,20 @@ impl Token {
     }
 }
 
+#[cfg(test)]
+impl Token {
+    /// A well-formed token that no edge knows.
+    pub(crate) fn sample() -> Self {
+        let json = format!(
+            r#"{{"a":"acct","s":"{}","t":"{}"}}"#,
+            STANDARD.encode(b"secret"),
+            Uuid::new_v4()
+        );
+
+        STANDARD.encode(json).parse().expect("sample token parses")
+    }
+}
+
 impl FromStr for Token {
     type Err = Error;
 

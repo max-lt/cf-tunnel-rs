@@ -30,6 +30,8 @@ mod proto;
 mod stream;
 mod token;
 mod tunnel;
+#[cfg(test)]
+mod tunnel_tests;
 mod wire;
 
 pub use client::{ClientConfig, ConnectionDetails, TunnelClient};
