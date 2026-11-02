@@ -12,7 +12,7 @@ use uuid::Uuid;
 
 use crate::{
     ClientConfig, Error, StreamKind, proto,
-    proto::{Incoming, fake_edge},
+    proto::{Caps, Incoming, fake_edge},
     stream::{parse_request, response_bytes},
     wire::{self, Builder, Message},
 };
@@ -124,13 +124,13 @@ fn the_tool_reads_our_rpc_messages() {
     );
 
     assert_eq!(
-        reference!(rpc(proto::finish(3, false))),
+        reference!(rpc(proto::finish(3, Caps::Keep))),
         "(finish = (questionId = 3, releaseResultCaps = false, \
          requireEarlyCancellationWorkaround = true))"
     );
 
     assert_eq!(
-        reference!(rpc(proto::finish(3, true))),
+        reference!(rpc(proto::finish(3, Caps::Release))),
         "(finish = (questionId = 3, releaseResultCaps = true, \
          requireEarlyCancellationWorkaround = true))"
     );

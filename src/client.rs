@@ -118,11 +118,6 @@ impl TunnelClient {
         }
     }
 
-    /// Resolves when the connection ends.
-    pub async fn closed(&self) -> Error {
-        self.conn.closed().await.into()
-    }
-
     /// Unregisters from the edge, then waits up to `grace` for the edge to
     /// close the connection. Requests in flight keep running during the wait.
     pub async fn shutdown(self, grace: Duration) {

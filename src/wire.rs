@@ -499,25 +499,30 @@ impl Builder {
         }
     }
 
-    fn set_bytes(&mut self, slot: Slot, bytes: &[u8], terminator: bool) {
-        let len = bytes.len() + usize::from(terminator);
-
-        // An empty value stays a null pointer.
-        if len == 0 {
+    /// Points `slot` to a byte list. An empty list stays a null pointer.
+    fn set_bytes(&mut self, slot: Slot, bytes: &[u8]) {
+        if bytes.is_empty() {
             return;
         }
 
-        let start = self.alloc(len.div_ceil(WORD));
+        let start = self.alloc(bytes.len().div_ceil(WORD));
         self.bytes[start..start + bytes.len()].copy_from_slice(bytes);
-        self.point(slot, start, LIST, BYTES | (len as u64) << 3);
+        self.point(slot, start, LIST, BYTES | (bytes.len() as u64) << 3);
     }
 
     pub(crate) fn set_text(&mut self, slot: Slot, text: &str) {
-        self.set_bytes(slot, text.as_bytes(), true);
+        // Text is a byte list that ends with a NUL. Empty text is a null pointer.
+        if text.is_empty() {
+            return;
+        }
+
+        let mut bytes = text.as_bytes().to_vec();
+        bytes.push(0);
+        self.set_bytes(slot, &bytes);
     }
 
     pub(crate) fn set_data(&mut self, slot: Slot, data: &[u8]) {
-        self.set_bytes(slot, data, false);
+        self.set_bytes(slot, data);
     }
 
     pub(crate) fn init_struct_list(
@@ -543,7 +548,7 @@ impl Builder {
         }
     }
 
-    /// The root pointer, for tests that make a struct the root of a message.
+    /// The root pointer, which names the first struct of the message.
     #[cfg(test)]
     pub(crate) fn root_slot(&self) -> Slot {
         Slot(0)

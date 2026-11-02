@@ -41,4 +41,12 @@ impl Error {
     pub(crate) fn is_duplicate(&self) -> bool {
         matches!(self, Error::Refused { cause, .. } if cause == "EDUPCONN")
     }
+
+    /// How long the edge asks the client to wait before it tries again.
+    pub(crate) fn retry_after(&self) -> Duration {
+        match self {
+            Error::Refused { retry_after, .. } => *retry_after,
+            _ => Duration::ZERO,
+        }
+    }
 }

@@ -8,8 +8,8 @@ use crate::{
 /// The RPC client on the control stream. It makes the few calls a tunnel
 /// connection needs and answers none: the edge never calls this stream.
 pub(crate) struct Control<R, W> {
-    recv: R,
-    send: W,
+    reader: R,
+    writer: W,
     /// The export id of the edge's registration capability.
     cap: u32,
     next_question: u32,
@@ -17,22 +17,24 @@ pub(crate) struct Control<R, W> {
 
 impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Control<R, W> {
     /// Asks the edge for its main capability.
-    pub(crate) async fn bootstrap(recv: R, send: W) -> Result<Self, Error> {
+    pub(crate) async fn bootstrap(reader: R, writer: W) -> Result<Self, Error> {
         let mut control = Self {
-            recv,
-            send,
+            reader,
+            writer,
             cap: 0,
             next_question: 0,
         };
 
         let question = control.next_question();
-        control.send(&proto::bootstrap(question)).await?;
+        control.transmit(&proto::bootstrap(question)).await?;
 
         let answer = control.wait_for(question).await?;
         control.cap = proto::bootstrap_cap(&answer)?;
 
         // Keep the capability: it is the one we call next.
-        control.send(&proto::finish(question, false)).await?;
+        control
+            .transmit(&proto::finish(question, proto::Caps::Keep))
+            .await?;
 
         Ok(control)
     }
@@ -74,20 +76,22 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Control<R, W> {
         fill: impl FnOnce(&mut wire::Builder, wire::Slot),
     ) -> Result<Message, Error> {
         let question = self.next_question();
-        self.send(&proto::call(question, self.cap, method, fill))
+        self.transmit(&proto::call(question, self.cap, method, fill))
             .await?;
 
         let answer = self.wait_for(question).await?;
 
         // The call is done. A failure to say so changes nothing.
-        let _ = self.send(&proto::finish(question, true)).await;
+        let _ = self
+            .transmit(&proto::finish(question, proto::Caps::Release))
+            .await;
 
         Ok(answer)
     }
 
-    async fn send(&mut self, message: &[u8]) -> Result<(), Error> {
-        self.send.write_all(message).await?;
-        self.send.flush().await?;
+    async fn transmit(&mut self, message: &[u8]) -> Result<(), Error> {
+        self.writer.write_all(message).await?;
+        self.writer.flush().await?;
 
         Ok(())
     }
@@ -95,7 +99,7 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Control<R, W> {
     /// Reads messages until the answer to `question` arrives.
     async fn wait_for(&mut self, question: u32) -> Result<Message, Error> {
         loop {
-            let message = wire::read_message(&mut self.recv).await?;
+            let message = wire::read_message(&mut self.reader).await?;
 
             match proto::classify(&message)? {
                 proto::Incoming::Return(answer) if answer == question => return Ok(message),

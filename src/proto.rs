@@ -45,9 +45,17 @@ pub(crate) fn bootstrap(question: u32) -> Vec<u8> {
     b.finish()
 }
 
-/// Tells the edge it can drop the answer to `question`. With `release_caps`
-/// false, the capabilities in that answer stay usable.
-pub(crate) fn finish(question: u32, release_caps: bool) -> Vec<u8> {
+/// What a `Finish` does with the capabilities in the answer it closes.
+#[derive(Clone, Copy)]
+pub(crate) enum Caps {
+    /// Drop them. The edge may free what they point to.
+    Release,
+    /// Keep them usable, for the calls that follow.
+    Keep,
+}
+
+/// Tells the edge it can drop the answer to `question`.
+pub(crate) fn finish(question: u32, caps: Caps) -> Vec<u8> {
     let mut b = Builder::new();
     let message = b.init_root(1, 1);
     b.set_u16(message, 0, FINISH);
@@ -56,7 +64,7 @@ pub(crate) fn finish(question: u32, release_caps: bool) -> Vec<u8> {
     b.set_u32(body, 0, question);
 
     // `releaseResultCaps` is true by default, so the stored bit is inverted.
-    b.set_bool(body, 32, !release_caps);
+    b.set_bool(body, 32, matches!(caps, Caps::Keep));
 
     b.finish()
 }

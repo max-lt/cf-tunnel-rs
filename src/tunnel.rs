@@ -97,6 +97,31 @@ impl Shared {
     fn set(&self, index: usize, status: ConnectionStatus) {
         self.status.send_modify(|all| all[index] = status);
     }
+
+    /// Takes an address no other connection uses, and reserves it.
+    fn reserve_address(&self, index: usize, attempt: usize) -> Option<SocketAddr> {
+        let mut in_use = self.in_use.lock().expect("in_use lock");
+        let taken: Vec<SocketAddr> = in_use
+            .iter()
+            .enumerate()
+            .filter(|(other, _)| *other != index)
+            .filter_map(|(_, addr)| *addr)
+            .collect();
+
+        let edge = self.regions.pick(index, attempt, &taken);
+        in_use[index] = edge;
+
+        edge
+    }
+
+    fn client_config(&self, index: usize, edge: SocketAddr) -> ClientConfig {
+        let mut config = ClientConfig::new(self.config.token.clone(), edge);
+        config.conn_index = index as u8;
+        config.client_id = self.config.client_id;
+        config.version = self.config.version.clone();
+
+        config
+    }
 }
 
 impl Tunnel {
@@ -185,92 +210,45 @@ impl Drop for Tunnel {
     }
 }
 
+/// How one attempt to keep a connection up ended.
+enum Attempt {
+    /// A stop request ended it.
+    Stopped,
+    /// It failed, and the next attempt can work. `stable` says the connection
+    /// lived long enough to restart the backoff.
+    Failed {
+        error: Error,
+        retry_after: Duration,
+        stable: bool,
+    },
+    /// The edge will refuse again, so retrying would only add noise.
+    Refused(Error),
+}
+
 /// Keeps connection `index` up until a stop is requested or the edge refuses it.
 async fn supervise(index: usize, shared: Arc<Shared>, mut stop: watch::Receiver<Option<Duration>>) {
     let mut attempt = 0;
 
-    loop {
-        // A stop request ends the loop between attempts.
-        if stop.borrow().is_some() {
-            break;
-        }
-
-        // Take an address no other connection uses, and reserve it.
-        let picked = {
-            let mut in_use = shared.in_use.lock().expect("in_use lock");
-            let taken: Vec<SocketAddr> = in_use
-                .iter()
-                .enumerate()
-                .filter(|(other, _)| *other != index)
-                .filter_map(|(_, addr)| *addr)
-                .collect();
-            let edge = shared.regions.pick(index, attempt, &taken);
-            in_use[index] = edge;
-
-            edge
-        };
-
-        let Some(edge) = picked else {
-            shared.set(index, ConnectionStatus::Failed("no edge address".into()));
-            let _ = shared.first.send(Err(Error::Dns("no edge address".into())));
-
-            return;
-        };
-
-        shared.set(index, ConnectionStatus::Connecting);
-
-        let mut config = ClientConfig::new(shared.config.token.clone(), edge);
-        config.conn_index = index as u8;
-        config.client_id = shared.config.client_id;
-        config.version = shared.config.version.clone();
-
-        // Dial, unless a stop request arrives first.
-        let connected = tokio::select! {
-            result = TunnelClient::connect(config) => result,
-            _ = stop.changed() => break,
-        };
-
-        let (error, retry_after) = match connected {
-            Ok(client) => {
-                shared.set(index, ConnectionStatus::Connected(client.details().clone()));
-                let _ = shared.first.send(Ok(()));
-
-                let started = Instant::now();
-                let ended = forward(client, &shared.streams, &mut stop).await;
-
-                // A stop request, not a failure, ended this connection.
-                let Some(error) = ended else {
-                    break;
-                };
-
-                if started.elapsed() >= STABLE_AFTER {
-                    attempt = 0;
-                }
-
-                (error, Duration::ZERO)
-            }
-
-            // Another connection holds this address. The next attempt picks a new one.
-            Err(error) if error.is_duplicate() => (error, Duration::ZERO),
-
-            // The edge will refuse again, so retrying would only add noise.
-            Err(
-                error @ Error::Refused {
-                    should_retry: false,
-                    ..
-                },
-            ) => {
+    while stop.borrow().is_none() {
+        let (error, retry_after, stable) = match run_once(index, attempt, &shared, &mut stop).await
+        {
+            Attempt::Stopped => break,
+            Attempt::Refused(error) => {
                 shared.set(index, ConnectionStatus::Failed(error.to_string()));
                 let _ = shared.first.send(Err(error));
 
                 return;
             }
-
-            Err(Error::Refused {
-                cause, retry_after, ..
-            }) => (Error::Protocol(cause), retry_after),
-            Err(error) => (error, Duration::ZERO),
+            Attempt::Failed {
+                error,
+                retry_after,
+                stable,
+            } => (error, retry_after, stable),
         };
+
+        if stable {
+            attempt = 0;
+        }
 
         let after = jitter(backoff(attempt).max(retry_after));
         shared.set(
@@ -290,6 +268,68 @@ async fn supervise(index: usize, shared: Arc<Shared>, mut stop: watch::Receiver<
     }
 
     shared.set(index, ConnectionStatus::Stopped);
+}
+
+/// Dials the edge once and serves the connection until it ends.
+async fn run_once(
+    index: usize,
+    attempt: usize,
+    shared: &Shared,
+    stop: &mut watch::Receiver<Option<Duration>>,
+) -> Attempt {
+    let Some(edge) = shared.reserve_address(index, attempt) else {
+        return Attempt::Refused(Error::Dns("no edge address".into()));
+    };
+
+    shared.set(index, ConnectionStatus::Connecting);
+
+    // Dial, unless a stop request arrives first.
+    let connected = tokio::select! {
+        result = TunnelClient::connect(shared.client_config(index, edge)) => result,
+        _ = stop.changed() => return Attempt::Stopped,
+    };
+
+    let client = match connected {
+        Ok(client) => client,
+
+        // Another connection holds this address. The next attempt picks a new one.
+        Err(error) if error.is_duplicate() => {
+            return Attempt::Failed {
+                error,
+                retry_after: Duration::ZERO,
+                stable: false,
+            };
+        }
+
+        Err(
+            error @ Error::Refused {
+                should_retry: false,
+                ..
+            },
+        ) => return Attempt::Refused(error),
+
+        Err(error) => {
+            return Attempt::Failed {
+                retry_after: error.retry_after(),
+                error,
+                stable: false,
+            };
+        }
+    };
+
+    shared.set(index, ConnectionStatus::Connected(client.details().clone()));
+    let _ = shared.first.send(Ok(()));
+
+    let started = Instant::now();
+
+    match forward(client, &shared.streams, stop).await {
+        None => Attempt::Stopped,
+        Some(error) => Attempt::Failed {
+            error,
+            retry_after: Duration::ZERO,
+            stable: started.elapsed() >= STABLE_AFTER,
+        },
+    }
 }
 
 /// Moves streams from one connection to the shared queue. Returns the error
