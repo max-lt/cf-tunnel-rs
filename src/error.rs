@@ -13,6 +13,10 @@ pub enum Error {
     Tls(String),
     #[error("RPC: {0}")]
     Rpc(String),
+    #[error("edge discovery: {0}")]
+    Dns(String),
+    #[error("tunnel stopped")]
+    Stopped,
     #[error("registration timed out")]
     RegistrationTimeout,
     #[error("edge refused registration: {cause}")]
@@ -46,5 +50,13 @@ impl From<capnp::NotInSchema> for Error {
 impl From<std::str::Utf8Error> for Error {
     fn from(e: std::str::Utf8Error) -> Self {
         Error::Rpc(e.to_string())
+    }
+}
+
+impl Error {
+    /// True when the edge refused because this client already has a connection
+    /// on that edge address. Retrying on another address works.
+    pub(crate) fn is_duplicate(&self) -> bool {
+        matches!(self, Error::Refused { cause, .. } if cause == "EDUPCONN")
     }
 }

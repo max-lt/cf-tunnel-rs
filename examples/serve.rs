@@ -1,15 +1,12 @@
-//! Register connections with the edge, then relay HTTP requests to ORIGIN.
-//! Usage: set -a; . ./.env; set +a; EDGE_ADDRS=<ip>:7844,<ip>:7844 cargo run --example serve
+//! Keep connections to the edge and relay HTTP requests to ORIGIN.
+//! Usage: set -a; . ./.env; set +a; cargo run --example serve
+//! Optional: EDGE_ADDRS=<ip>:7844,... skips discovery; CONNECTIONS=<n>; ORIGIN=<host:port>.
 
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 
 use anyhow::{Context, Result, bail};
-use cf_tunnel_rs::{ClientConfig, ConnectRequest, IncomingStream, StreamKind, TunnelClient};
-use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
-    sync::watch,
-    task::JoinSet,
-};
+use cf_tunnel_rs::{ConnectRequest, EdgeSource, IncomingStream, StreamKind, Tunnel, TunnelConfig};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 const GRACE: Duration = Duration::from_secs(3);
 /// Headers that describe the hop to the origin, not the request itself.
@@ -21,55 +18,40 @@ async fn main() -> Result<()> {
     let token = std::env::var("TUNNEL_TOKEN")
         .context("TUNNEL_TOKEN is not set")?
         .parse()?;
-    let edges = std::env::var("EDGE_ADDRS")
-        .context("EDGE_ADDRS is not set (comma-separated ip:port)")?
-        .split(',')
-        .map(str::parse)
-        .collect::<Result<Vec<SocketAddr>, _>>()?;
     let origin: Arc<str> = std::env::var("ORIGIN")
         .unwrap_or_else(|_| "localhost:3000".into())
         .into();
 
-    // One connection per edge address. They share the client id of the first config.
-    let base = ClientConfig::new(token, edges[0]);
-    let (stop_tx, stop_rx) = watch::channel(false);
-    let mut servers = JoinSet::new();
+    let mut config = TunnelConfig::new(token);
 
-    for (index, edge) in edges.into_iter().enumerate() {
-        let mut config = base.clone();
-        config.edge = edge;
-        config.conn_index = index as u8;
-
-        let client = TunnelClient::connect(config).await?;
-        let details = client.details();
-        eprintln!(
-            "conn {index} registered: location={} uuid={}",
-            details.location, details.uuid
-        );
-
-        servers.spawn(serve(client, origin.clone(), stop_rx.clone()));
+    // Both settings are optional. Without them the edge is discovered.
+    if let Ok(list) = std::env::var("EDGE_ADDRS") {
+        let addrs = list
+            .split(',')
+            .map(str::parse)
+            .collect::<Result<Vec<SocketAddr>, _>>()?;
+        config.edge = EdgeSource::Fixed(addrs);
     }
 
+    if let Ok(count) = std::env::var("CONNECTIONS") {
+        config.connections = count.parse()?;
+    }
+
+    let tunnel = Tunnel::start(config).await?;
     eprintln!("serving origin {origin}; Ctrl-C to stop");
 
-    // Run until Ctrl-C, or until any connection ends.
-    tokio::select! {
-        _ = tokio::signal::ctrl_c() => {}
-        _ = servers.join_next() => eprintln!("a connection ended; stopping"),
-    }
+    // Print the state of the connections whenever it changes.
+    let mut status = tunnel.status();
+    tokio::spawn(async move {
+        while status.changed().await.is_ok() {
+            let states: Vec<String> = status.borrow().iter().map(describe).collect();
+            eprintln!("connections: {}", states.join(" | "));
+        }
+    });
 
-    // Tell every connection to unregister, then wait for them.
-    stop_tx.send(true)?;
-    while servers.join_next().await.is_some() {}
-
-    Ok(())
-}
-
-/// Serves one connection until it fails or `stop` fires.
-async fn serve(client: TunnelClient, origin: Arc<str>, mut stop: watch::Receiver<bool>) {
-    loop {
+    let result = loop {
         tokio::select! {
-            stream = client.accept() => match stream {
+            stream = tunnel.accept() => match stream {
                 // Each request runs in its own task.
                 Ok(stream) => {
                     let origin = origin.clone();
@@ -79,16 +61,28 @@ async fn serve(client: TunnelClient, origin: Arc<str>, mut stop: watch::Receiver
                         }
                     });
                 }
-                Err(e) => {
-                    eprintln!("connection: {e}");
-                    break;
-                }
+                Err(e) => break Err(e.into()),
             },
-            _ = stop.changed() => break,
+            _ = tokio::signal::ctrl_c() => break Ok(()),
         }
-    }
+    };
 
-    client.shutdown(GRACE).await;
+    tunnel.shutdown(GRACE).await;
+
+    result
+}
+
+fn describe(status: &cf_tunnel_rs::ConnectionStatus) -> String {
+    use cf_tunnel_rs::ConnectionStatus::*;
+
+    match status {
+        Connecting => "connecting".into(),
+        Connected(details) => format!("up {}", details.location),
+        Retrying { error, after } => format!("retry in {after:.1?} ({error})"),
+        Failed(error) => format!("failed ({error})"),
+        Stopped => "stopped".into(),
+        _ => "unknown".into(),
+    }
 }
 
 async fn proxy(stream: IncomingStream, origin: &str) -> Result<()> {

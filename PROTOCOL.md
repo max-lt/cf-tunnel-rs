@@ -168,6 +168,17 @@ Tested with `examples/serve.rs` and a published application
   answers them with its management service (`management/service.go`). The URL
   carries a token, so a client must not log it.
 - The edge picks the connection for each request. The client does not route.
+- The SRV lookup returns two targets (`region1.v2.argotunnel.com` and
+  `region2.v2.argotunnel.com`), each with 10 IPv4 addresses on port 7844.
+- Four connections of one client, spread over both regions, landed on
+  `mrs01`, `mrs04` and `mrs07` from Malta. The edge picks the colo from the
+  client network, not from the region. Another tunnel in France landed on
+  `cdg` and `ams`.
+- A second connection of the same client on an edge address that another
+  connection already uses is refused with `EDUPCONN`. Retrying on another
+  address works.
+- The dashboard shows a tunnel as healthy with 4 connections and as degraded
+  with 1.
 - The `dest` field holds the public URL. The client picks the origin itself.
 
 ## 6. Streams opened by the edge
@@ -301,7 +312,6 @@ on Windows. The maximum UDP payload is 1280 bytes on unix.
 
 ## 8. Not read
 
-- Region selection (`edgediscovery/allregions/region.go`, `regions.go`).
 - ICMP datagrams (`quic/v3/icmp.go`).
 - The trace ID length in version 2 IP packets with trace.
 - Retry and backoff policy (`supervisor/`).

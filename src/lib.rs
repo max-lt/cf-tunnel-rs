@@ -19,9 +19,11 @@
 //! ```
 
 mod client;
+mod edge;
 mod error;
 mod stream;
 mod token;
+mod tunnel;
 
 #[allow(clippy::all, dead_code)]
 mod tunnelrpc_capnp {
@@ -37,3 +39,4 @@ pub use client::{ClientConfig, ConnectionDetails, TunnelClient};
 pub use error::Error;
 pub use stream::{ConnectRequest, IncomingStream, Responder, StreamKind};
 pub use token::Token;
+pub use tunnel::{ConnectionStatus, EdgeSource, Tunnel, TunnelConfig};
