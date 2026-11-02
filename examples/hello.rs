@@ -9,7 +9,8 @@ use cf_tunnel_rs::{Tunnel, TunnelConfig};
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let token = std::env::var("TUNNEL_TOKEN")?.parse()?;
-    let app = Router::new().route("/", get(|| async { "Hello from cf-tunnel-rs\n" }));
+    let hello = || async { "Hello from cf-tunnel-rs\n" };
+    let app = Router::new().route("/", get(hello));
 
     let tunnel = Tunnel::start(TunnelConfig::new(token)).await?;
 

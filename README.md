@@ -9,21 +9,35 @@ protocol without notice. [PROTOCOL.md](PROTOCOL.md) describes what this crate us
 ## Quick start
 
 Create a tunnel in the Cloudflare dashboard. Copy its token. Add a public
-hostname to the tunnel. Then serve an axum app through it:
+hostname to the tunnel. Then serve an axum app through it (`examples/hello.rs`):
 
 ```rust
+use std::time::Duration;
+
 use axum::{Router, routing::get};
 use cf_tunnel_rs::{Tunnel, TunnelConfig};
 
-let token = std::env::var("TUNNEL_TOKEN")?.parse()?;
-let app = Router::new().route("/", get(|| async { "Hello" }));
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let token = std::env::var("TUNNEL_TOKEN")?.parse()?;
+    let hello = || async { "Hello from cf-tunnel-rs\n" };
+    let app = Router::new().route("/", get(hello));
 
-Tunnel::start(TunnelConfig::new(token)).await?.serve(app).await?;
+    let tunnel = Tunnel::start(TunnelConfig::new(token)).await?;
+
+    // Serve until Ctrl-C, then unregister.
+    tokio::select! {
+        result = tunnel.serve(app) => result?,
+        _ = tokio::signal::ctrl_c() => {}
+    }
+
+    tunnel.shutdown(Duration::from_secs(3)).await;
+
+    Ok(())
+}
 ```
 
 This needs the `http` feature. `serve` accepts a `tower` service.
-
-Run the complete example:
 
 ```
 TUNNEL_TOKEN=<token> cargo run --features http --example hello
