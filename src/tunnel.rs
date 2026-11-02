@@ -11,7 +11,10 @@ use tokio::{
 use uuid::Uuid;
 
 use crate::edge::EdgeRegions;
-use crate::{ClientConfig, ConnectionDetails, Error, IncomingStream, Token, TunnelClient};
+use crate::{
+    ClientConfig, ConnectionDetails, Error, IncomingStream, Token,
+    client::{Session, pump_streams},
+};
 
 const DEFAULT_CONNECTIONS: u8 = 4;
 const MIN_BACKOFF: Duration = Duration::from_secs(1);
@@ -285,12 +288,12 @@ async fn run_once(
 
     // Dial, unless a stop request arrives first.
     let connected = tokio::select! {
-        result = TunnelClient::connect(shared.client_config(index, edge)) => result,
+        result = Session::open(shared.client_config(index, edge)) => result,
         _ = stop.changed() => return Attempt::Stopped,
     };
 
-    let client = match connected {
-        Ok(client) => client,
+    let session = match connected {
+        Ok(session) => session,
 
         // Another connection holds this address. The next attempt picks a new one.
         Err(error) if error.is_duplicate() => {
@@ -317,49 +320,41 @@ async fn run_once(
         }
     };
 
-    shared.set(index, ConnectionStatus::Connected(client.details().clone()));
+    shared.set(
+        index,
+        ConnectionStatus::Connected(session.details().clone()),
+    );
     let _ = shared.first.send(Ok(()));
 
     let started = Instant::now();
 
-    match forward(client, &shared.streams, stop).await {
-        None => Attempt::Stopped,
-        Some(error) => Attempt::Failed {
+    // Serve the connection in this task, until it ends or a stop request comes.
+    let served = tokio::select! {
+        result = pump_streams(session.connection().clone(), shared.streams.clone()) => Some(result),
+        _ = stop.changed() => None,
+    };
+
+    match served {
+        // A stop request: unregister, then wait out the grace period.
+        None => {
+            let grace = stop.borrow().unwrap_or_default();
+            session.shutdown(grace).await;
+
+            Attempt::Stopped
+        }
+
+        // Nobody reads the queue, so the Tunnel was dropped.
+        Some(Ok(())) => {
+            session.shutdown(Duration::ZERO).await;
+
+            Attempt::Stopped
+        }
+
+        Some(Err(error)) => Attempt::Failed {
             error,
             retry_after: Duration::ZERO,
             stable: started.elapsed() >= STABLE_AFTER,
         },
-    }
-}
-
-/// Moves streams from one connection to the shared queue. Returns the error
-/// that ended the connection, or `None` after a stop request.
-async fn forward(
-    client: TunnelClient,
-    streams: &mpsc::Sender<IncomingStream>,
-    stop: &mut watch::Receiver<Option<Duration>>,
-) -> Option<Error> {
-    loop {
-        tokio::select! {
-            accepted = client.accept() => match accepted {
-                Ok(stream) => {
-                    // The Tunnel was dropped, so nobody reads the queue.
-                    if streams.send(stream).await.is_err() {
-                        client.shutdown(Duration::ZERO).await;
-
-                        return None;
-                    }
-                }
-                Err(error) => return Some(error),
-            },
-
-            _ = stop.changed() => {
-                let grace = stop.borrow().unwrap_or_default();
-                client.shutdown(grace).await;
-
-                return None;
-            }
-        }
     }
 }
 

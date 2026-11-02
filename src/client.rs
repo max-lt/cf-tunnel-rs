@@ -57,21 +57,18 @@ pub struct ConnectionDetails {
     pub remotely_managed: bool,
 }
 
-/// One registered connection to the edge.
-///
-/// Call [`shutdown`](Self::shutdown) to unregister before closing. Dropping the
-/// client closes the QUIC connection without unregistering.
-pub struct TunnelClient {
+/// A connection to the edge that is dialed and registered. Nothing accepts its
+/// request streams yet.
+pub(crate) struct Session {
     endpoint: quinn::Endpoint,
     conn: quinn::Connection,
     details: ConnectionDetails,
-    incoming: Mutex<mpsc::Receiver<IncomingStream>>,
     control: Control<RecvStream, SendStream>,
 }
 
-impl TunnelClient {
+impl Session {
     /// Dials the edge and registers the connection.
-    pub async fn connect(config: ClientConfig) -> Result<Self, Error> {
+    pub(crate) async fn open(config: ClientConfig) -> Result<Self, Error> {
         // Bind the local socket in the edge's IP family.
         let bind: SocketAddr = match config.edge {
             SocketAddr::V4(_) => (Ipv4Addr::UNSPECIFIED, 0).into(),
@@ -97,7 +94,6 @@ impl TunnelClient {
         let (control, details) = registered;
 
         Ok(Self {
-            incoming: Mutex::new(spawn_acceptor(conn.clone())),
             endpoint,
             conn,
             details,
@@ -105,22 +101,17 @@ impl TunnelClient {
         })
     }
 
-    pub fn details(&self) -> &ConnectionDetails {
+    pub(crate) fn details(&self) -> &ConnectionDetails {
         &self.details
     }
 
-    /// Waits for the next request stream from the edge. Safe to cancel.
-    /// Fails once the connection has ended.
-    pub async fn accept(&self) -> Result<IncomingStream, Error> {
-        match self.incoming.lock().await.recv().await {
-            Some(stream) => Ok(stream),
-            None => Err(self.conn.closed().await.into()),
-        }
+    pub(crate) fn connection(&self) -> &quinn::Connection {
+        &self.conn
     }
 
     /// Unregisters from the edge, then waits up to `grace` for the edge to
     /// close the connection. Requests in flight keep running during the wait.
-    pub async fn shutdown(self, grace: Duration) {
+    pub(crate) async fn shutdown(self, grace: Duration) {
         let Self {
             endpoint,
             conn,
@@ -140,41 +131,80 @@ impl TunnelClient {
     }
 }
 
-/// Reads each stream's preamble in its own task, so a silent peer blocks
-/// nothing. The task ends when the client is dropped or the connection closes.
-fn spawn_acceptor(conn: quinn::Connection) -> mpsc::Receiver<IncomingStream> {
-    let (tx, rx) = mpsc::channel(STREAM_QUEUE);
+/// One registered connection to the edge.
+///
+/// Call [`shutdown`](Self::shutdown) to unregister before closing. Dropping the
+/// client closes the QUIC connection without unregistering.
+pub struct TunnelClient {
+    session: Session,
+    incoming: Mutex<mpsc::Receiver<IncomingStream>>,
+}
 
-    tokio::spawn(async move {
-        loop {
-            // Wait for the edge to open a stream. Stop when the connection
-            // ends or nobody listens any more.
-            let (send, recv) = tokio::select! {
-                accepted = conn.accept_bi() => match accepted {
-                    Ok(streams) => streams,
-                    Err(_) => return,
-                },
-                _ = tx.closed() => return,
-            };
+impl TunnelClient {
+    /// Dials the edge and registers the connection.
+    pub async fn connect(config: ClientConfig) -> Result<Self, Error> {
+        let session = Session::open(config).await?;
 
-            // Parse the request away from the accept loop.
-            let tx = tx.clone();
-            tokio::spawn(async move {
-                let read = tokio::time::timeout(PREAMBLE_TIMEOUT, IncomingStream::read(send, recv));
+        // Nothing else reads this connection, so a task moves its streams to
+        // the queue. It ends when the client is dropped.
+        let (queue, incoming) = mpsc::channel(STREAM_QUEUE);
+        tokio::spawn(pump_streams(session.connection().clone(), queue));
 
-                match read.await {
-                    Ok(Ok(Some(stream))) => {
-                        let _ = tx.send(stream).await;
-                    }
-                    Ok(Ok(None)) => tracing::debug!("dropped edge RPC stream"),
-                    Ok(Err(e)) => tracing::debug!("dropped malformed stream: {e}"),
-                    Err(_) => tracing::debug!("dropped stream with no request"),
-                }
-            });
+        Ok(Self {
+            session,
+            incoming: Mutex::new(incoming),
+        })
+    }
+
+    pub fn details(&self) -> &ConnectionDetails {
+        self.session.details()
+    }
+
+    /// Waits for the next request stream from the edge. Safe to cancel.
+    /// Fails once the connection has ended.
+    pub async fn accept(&self) -> Result<IncomingStream, Error> {
+        match self.incoming.lock().await.recv().await {
+            Some(stream) => Ok(stream),
+            None => Err(self.session.connection().closed().await.into()),
         }
-    });
+    }
 
-    rx
+    /// Unregisters from the edge, then waits up to `grace` for the edge to
+    /// close the connection. Requests in flight keep running during the wait.
+    pub async fn shutdown(self, grace: Duration) {
+        self.session.shutdown(grace).await;
+    }
+}
+
+/// Moves the request streams of `conn` into `queue`. Each preamble is read in
+/// its own task, so a silent peer blocks nothing. Returns the error that ended
+/// the connection, or `Ok` once nobody reads the queue any more.
+pub(crate) async fn pump_streams(
+    conn: quinn::Connection,
+    queue: mpsc::Sender<IncomingStream>,
+) -> Result<(), Error> {
+    loop {
+        // Wait for the edge to open a stream, unless nobody listens.
+        let (send, recv) = tokio::select! {
+            accepted = conn.accept_bi() => accepted?,
+            _ = queue.closed() => return Ok(()),
+        };
+
+        // Parse the request away from the accept loop.
+        let queue = queue.clone();
+        tokio::spawn(async move {
+            let read = tokio::time::timeout(PREAMBLE_TIMEOUT, IncomingStream::read(send, recv));
+
+            match read.await {
+                Ok(Ok(Some(stream))) => {
+                    let _ = queue.send(stream).await;
+                }
+                Ok(Ok(None)) => tracing::debug!("dropped edge RPC stream"),
+                Ok(Err(e)) => tracing::debug!("dropped malformed stream: {e}"),
+                Err(_) => tracing::debug!("dropped stream with no request"),
+            }
+        });
+    }
 }
 
 fn root_store() -> Result<rustls::RootCertStore, Error> {
