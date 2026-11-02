@@ -81,13 +81,11 @@ background after a network failure, so wrap it in a timeout if you cannot wait.
 
 ## Build and test
 
-You need Rust 1.85 or later and a C compiler. The TLS library `ring` compiles
-some C code.
+You need Rust 1.85 or later.
 
-The Cap'n Proto wire format is read and written by `src/wire.rs`. `cargo test`
-compares that code with the reference `capnp` tool when the tool is on the PATH,
-for example after `brew install capnp`. The tests use the schemas in
-`tests/schema`. Those tests skip when the tool is missing.
+`cargo test` also compares the wire codec in `src/wire.rs` with the reference
+`capnp` tool, when the tool is on the PATH. The schemas are in `tests/schema`.
+Those tests skip when the tool is missing.
 
 ## License
 
