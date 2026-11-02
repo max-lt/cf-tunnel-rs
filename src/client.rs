@@ -80,18 +80,24 @@ pub struct TunnelClient {
 impl TunnelClient {
     /// Dials the edge and registers the connection.
     pub async fn connect(config: ClientConfig) -> Result<Self, Error> {
+        // Bind the local socket in the edge's IP family.
         let bind: SocketAddr = match config.edge {
             SocketAddr::V4(_) => (Ipv4Addr::UNSPECIFIED, 0).into(),
             SocketAddr::V6(_) => (Ipv6Addr::UNSPECIFIED, 0).into(),
         };
+
         let mut endpoint = quinn::Endpoint::client(bind)?;
         endpoint.set_default_client_config(quic_config()?);
         let conn = endpoint.connect(config.edge, SERVER_NAME)?.await?;
+
+        // The edge treats the first stream as the control stream.
         let (send, recv) = conn.open_bi().await?;
 
         let (ready_tx, ready_rx) = oneshot::channel();
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let (done_tx, done_rx) = oneshot::channel();
+
+        // capnp-rpc is not Send, so the control stream gets its own thread.
         std::thread::Builder::new()
             .name("cf-tunnel-control".into())
             .spawn(move || {
@@ -110,9 +116,11 @@ impl TunnelClient {
                 let _ = done_tx.send(());
             })?;
 
+        // Wait for the registration result from the control thread.
         let details = ready_rx
             .await
             .map_err(|_| Error::Protocol("control thread ended before registration".into()))??;
+
         Ok(Self {
             incoming: Mutex::new(spawn_acceptor(conn.clone())),
             endpoint,
@@ -151,9 +159,15 @@ impl TunnelClient {
             done,
             ..
         } = self;
+
+        // Dropping the sender tells the control thread to unregister.
         drop(shutdown);
         let _ = tokio::time::timeout(UNREGISTER_TIMEOUT, done).await;
+
+        // The edge closes the connection after unregister. Wait for it so
+        // requests in flight can finish.
         let _ = tokio::time::timeout(grace, conn.closed()).await;
+
         conn.close(0u32.into(), b"");
         endpoint.wait_idle().await;
     }
@@ -163,8 +177,11 @@ impl TunnelClient {
 /// nothing. The task ends when the client is dropped or the connection closes.
 fn spawn_acceptor(conn: quinn::Connection) -> mpsc::Receiver<IncomingStream> {
     let (tx, rx) = mpsc::channel(STREAM_QUEUE);
+
     tokio::spawn(async move {
         loop {
+            // Wait for the edge to open a stream. Stop when the connection
+            // ends or nobody listens any more.
             let (send, recv) = tokio::select! {
                 accepted = conn.accept_bi() => match accepted {
                     Ok(streams) => streams,
@@ -172,9 +189,12 @@ fn spawn_acceptor(conn: quinn::Connection) -> mpsc::Receiver<IncomingStream> {
                 },
                 _ = tx.closed() => return,
             };
+
+            // Parse the request away from the accept loop.
             let tx = tx.clone();
             tokio::spawn(async move {
                 let read = tokio::time::timeout(PREAMBLE_TIMEOUT, IncomingStream::read(send, recv));
+
                 match read.await {
                     Ok(Ok(Some(stream))) => {
                         let _ = tx.send(stream).await;
@@ -186,19 +206,24 @@ fn spawn_acceptor(conn: quinn::Connection) -> mpsc::Receiver<IncomingStream> {
             });
         }
     });
+
     rx
 }
 
 fn root_store() -> Result<rustls::RootCertStore, Error> {
     let mut roots = rustls::RootCertStore::empty();
+
+    // Every certificate of the bundle must parse and load.
     for cert in CertificateDer::pem_slice_iter(ROOTS) {
         let cert = cert.map_err(|e| Error::Tls(e.to_string()))?;
         roots.add(cert).map_err(|e| Error::Tls(e.to_string()))?;
     }
+
     Ok(roots)
 }
 
 fn quic_config() -> Result<quinn::ClientConfig, Error> {
+    // TLS 1.3 against the Cloudflare roots only, with the edge's ALPN.
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let mut tls = rustls::ClientConfig::builder_with_provider(provider)
         .with_protocol_versions(&[&rustls::version::TLS13])
@@ -207,6 +232,8 @@ fn quic_config() -> Result<quinn::ClientConfig, Error> {
         .with_no_client_auth();
     tls.alpn_protocols = vec![ALPN.to_vec()];
 
+    // Same timings as cloudflared: a keep-alive well under the idle timeout
+    // keeps a quiet tunnel up.
     let mut transport = quinn::TransportConfig::default();
     transport.keep_alive_interval(Some(Duration::from_secs(1)));
     transport.max_idle_timeout(Some(
@@ -216,10 +243,12 @@ fn quic_config() -> Result<quinn::ClientConfig, Error> {
     ));
     transport.initial_mtu(1232);
     transport.max_concurrent_bidi_streams(MAX_BIDI_STREAMS);
+
     let crypto = quinn::crypto::rustls::QuicClientConfig::try_from(tls)
         .map_err(|e| Error::Tls(e.to_string()))?;
     let mut config = quinn::ClientConfig::new(Arc::new(crypto));
     config.transport_config(Arc::new(transport));
+
     Ok(config)
 }
 
@@ -231,6 +260,7 @@ async fn control(
     ready: oneshot::Sender<Result<ConnectionDetails, Error>>,
     shutdown: oneshot::Receiver<()>,
 ) {
+    // Run the RPC system on the control stream, with the edge as bootstrap.
     let network = twoparty::VatNetwork::new(
         recv.compat(),
         send.compat_write(),
@@ -246,9 +276,12 @@ async fn control(
         .unwrap_or(Err(Error::RegistrationTimeout));
     let ok = registered.is_ok();
     let _ = ready.send(registered);
+
+    // After a failed registration there is nothing to unregister.
     if !ok {
         return;
     }
+
     let _ = shutdown.await;
     let _ = client.unregister_connection_request().send().promise.await;
 }
@@ -258,6 +291,8 @@ async fn register(
     config: &ClientConfig,
 ) -> Result<ConnectionDetails, Error> {
     let mut request = client.register_connection_request();
+
+    // Fill in the credentials and the client description.
     {
         let mut params = request.get();
         let mut auth = params.reborrow().init_auth();
@@ -271,7 +306,10 @@ async fn register(
         info.set_version(config.version.as_str());
         info.set_arch(std::env::consts::ARCH);
     }
+
     let reply = request.send().promise.await?;
+
+    // The edge answers with either the connection details or a refusal.
     match reply.get()?.get_result()?.get_result().which()? {
         connection_response::result::Which::ConnectionDetails(details) => {
             let details = details?;

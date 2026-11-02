@@ -59,6 +59,8 @@ impl ConnectRequest {
         let Some((_, rest)) = self.dest.split_once("://") else {
             return Cow::Borrowed("/");
         };
+
+        // The path starts at the first `/`. A query with no path needs a `/` in front.
         match rest.find(['/', '?']) {
             Some(i) if rest[i..].starts_with('/') => Cow::Borrowed(&rest[i..]),
             Some(i) => Cow::Owned(format!("/{}", &rest[i..])),
@@ -82,22 +84,30 @@ impl IncomingStream {
     ) -> Result<Option<Self>, Error> {
         let mut signature = [0u8; 6];
         recv.read_exact(&mut signature).await?;
+
+        // RPC streams carry no request, so the caller skips them.
         if signature == RPC_SIGNATURE {
             return Ok(None);
         }
+
         if signature != DATA_SIGNATURE {
             return Err(Error::Protocol(format!(
                 "unknown signature {signature:02x?}"
             )));
         }
+
         let mut version = [0u8; 2];
         recv.read_exact(&mut version).await?;
+
+        // Fail closed on a version this crate does not know.
         if version != VERSION {
             return Err(Error::Protocol(format!("unknown version {version:02x?}")));
         }
+
         let message =
             capnp_futures::serialize::read_message((&mut recv).compat(), Default::default())
                 .await?;
+
         Ok(Some(Self {
             request: parse_request(&message)?,
             recv,
@@ -120,11 +130,14 @@ fn parse_request<S: capnp::message::ReaderSegments>(
     message: &capnp::message::Reader<S>,
 ) -> Result<ConnectRequest, Error> {
     let root = message.get_root::<connect_request::Reader>()?;
+
     let kind = match root.get_type()? {
         ConnectionType::Http => StreamKind::Http,
         ConnectionType::Websocket => StreamKind::WebSocket,
         ConnectionType::Tcp => StreamKind::Tcp,
     };
+
+    // Copy the key-value entries out of the message.
     let mut metadata = Vec::new();
     for entry in root.get_metadata()? {
         metadata.push((
@@ -132,6 +145,7 @@ fn parse_request<S: capnp::message::ReaderSegments>(
             entry.get_val()?.to_str()?.to_owned(),
         ));
     }
+
     Ok(ConnectRequest {
         dest: root.get_dest()?.to_str()?.to_owned(),
         kind,
@@ -161,13 +175,16 @@ impl Responder {
         status: u16,
         headers: impl IntoIterator<Item = (&'a str, &'a str)>,
     ) -> Result<SendStream, Error> {
+        // The edge reads the status and each header from metadata entries.
         let status = status.to_string();
         let names: Vec<(String, &str)> = headers
             .into_iter()
             .map(|(name, val)| (format!("{HEADER_PREFIX}{name}"), val))
             .collect();
+
         let mut metadata = vec![(STATUS_KEY, status.as_str())];
         metadata.extend(names.iter().map(|(k, v)| (k.as_str(), *v)));
+
         self.accept(&metadata).await
     }
 
@@ -184,11 +201,15 @@ impl Responder {
 /// Preamble followed by one `ConnectResponse` message.
 fn response_bytes(error: Option<&str>, metadata: &[(&str, &str)]) -> Vec<u8> {
     let mut message = capnp::message::Builder::new_default();
+
+    // Build the message in a scope so its borrow ends before serializing.
     {
         let mut response = message.init_root::<connect_response::Builder>();
+
         if let Some(error) = error {
             response.set_error(error);
         }
+
         let mut list = response.init_metadata(metadata.len() as u32);
         for (i, (key, val)) in metadata.iter().enumerate() {
             let mut entry = list.reborrow().get(i as u32);
@@ -196,6 +217,7 @@ fn response_bytes(error: Option<&str>, metadata: &[(&str, &str)]) -> Vec<u8> {
             entry.set_val(val);
         }
     }
+
     let words = capnp::serialize::write_message_to_words(&message);
     let mut out = Vec::with_capacity(DATA_SIGNATURE.len() + VERSION.len() + words.len());
     out.extend_from_slice(&DATA_SIGNATURE);
