@@ -131,6 +131,19 @@ The client removes deprecated strings (`serialized_headers`, `quick_reconnects`,
 reads a percentage from the TXT record `cfd-features.argotunnel.com` (a JSON
 object, refreshed on a timer). The same record has a `SkipPrechecks` switch.
 
+### 5.3 Observed behavior
+
+Tested with `examples/spike.rs` against `198.41.192.167:7844` (`region1`),
+a remotely managed tunnel:
+
+- The handshake succeeds with TLS 1.3, `ring`, ALPN `argotunnel` and the
+  Cloudflare Origin CA roots only. No post-quantum group is needed.
+- `capnp-rpc` 0.27 and the edge interoperate. `registerConnection` returns
+  `ConnectionDetails` (`locationName` `mrs04`, `tunnelIsRemotelyManaged` true).
+- The connection stays open for at least 12 s with a 1 s keep-alive.
+- `unregisterConnection` gets no RPC reply. The edge closes the QUIC
+  connection with application error code 0.
+
 ## 6. Streams opened by the edge
 
 Every stream starts with a 6-byte signature
