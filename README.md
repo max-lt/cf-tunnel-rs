@@ -37,8 +37,9 @@ async fn main() -> anyhow::Result<()> {
 }
 ```
 
-This needs the `http` feature. `serve` accepts a `tower` service. It also
-upgrades WebSocket requests, so an axum `WebSocketUpgrade` route works.
+This needs the `http` feature. `serve` accepts a `tower` service. Enable the
+`websocket` feature to upgrade WebSocket requests too, for example with an axum
+`WebSocketUpgrade` route.
 
 ```
 TUNNEL_TOKEN=<token> cargo run --features http --example hello
@@ -93,7 +94,7 @@ background after a network failure, so wrap it in a timeout if you cannot wait.
 | --- | --- |
 | `hello` | Serves an axum app. Needs `--features http`. |
 | `relay` | Forwards HTTP requests to a local port. Set `ORIGIN=host:port`. |
-| `chat` | Serves a WebSocket chat room. Needs `--features http`. |
+| `chat` | Serves a WebSocket chat room. Needs `--features websocket`. |
 
 ## Build and test
 

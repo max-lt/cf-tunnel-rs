@@ -17,7 +17,11 @@ use quinn::RecvStream;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, DuplexStream};
 use tower_service::Service;
 
-use super::{Body, BoxError, HOP_HEADERS, request_builder, status_only};
+use super::{
+    Body, BoxError,
+    request::request_builder,
+    response::{HOP_HEADERS, status_only},
+};
 use crate::{ConnectRequest, Responder};
 
 const PIPE_SIZE: usize = 64 * 1024;

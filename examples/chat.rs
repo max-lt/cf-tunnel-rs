@@ -1,5 +1,5 @@
 //! A chat room over WebSocket. Every message goes to every browser.
-//! Usage: set -a; . ./.env; set +a; cargo run --features http --example chat
+//! Usage: set -a; . ./.env; set +a; cargo run --features websocket --example chat
 //! Then open the tunnel hostname in two browser tabs.
 
 use std::sync::atomic::{AtomicUsize, Ordering};

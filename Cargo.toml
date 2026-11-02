@@ -41,12 +41,11 @@ http = [
     "dep:http",
     "dep:http-body",
     "dep:http-body-util",
-    "dep:httparse",
-    "dep:hyper",
-    "dep:hyper-util",
     "dep:tokio-util",
     "dep:tower-service",
 ]
+# Upgrades WebSocket requests, so an axum `WebSocketUpgrade` route works.
+websocket = ["http", "dep:httparse", "dep:hyper", "dep:hyper-util"]
 
 [[example]]
 name = "hello"
@@ -54,4 +53,4 @@ required-features = ["http"]
 
 [[example]]
 name = "chat"
-required-features = ["http"]
+required-features = ["websocket"]

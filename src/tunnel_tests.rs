@@ -414,7 +414,7 @@ async fn shutdown_unregisters_and_stops() {
 }
 
 /// Headers the edge forwards for a browser that opens a WebSocket.
-#[cfg(feature = "http")]
+#[cfg(feature = "websocket")]
 const WEBSOCKET_HEADERS: &[(&str, &str)] = &[
     ("HttpMethod", "GET"),
     ("HttpHeader:Sec-Websocket-Key", "dGhlIHNhbXBsZSBub25jZQ=="),
@@ -422,7 +422,7 @@ const WEBSOCKET_HEADERS: &[(&str, &str)] = &[
 ];
 
 /// An app that sends every WebSocket message back.
-#[cfg(feature = "http")]
+#[cfg(feature = "websocket")]
 fn echo_app() -> axum::Router {
     use axum::{
         extract::ws::{Message, WebSocketUpgrade},
@@ -448,7 +448,7 @@ fn echo_app() -> axum::Router {
 }
 
 /// A frame as a browser sends it: masked, with a payload under 126 bytes.
-#[cfg(feature = "http")]
+#[cfg(feature = "websocket")]
 fn browser_frame(opcode: u8, payload: &[u8]) -> Vec<u8> {
     const MASK: [u8; 4] = [1, 2, 3, 4];
 
@@ -464,7 +464,7 @@ fn browser_frame(opcode: u8, payload: &[u8]) -> Vec<u8> {
     frame
 }
 
-#[cfg(feature = "http")]
+#[cfg(feature = "websocket")]
 #[tokio::test]
 async fn upgrades_a_websocket_through_the_service() {
     const TEXT: u8 = 0x1;
@@ -520,7 +520,7 @@ async fn upgrades_a_websocket_through_the_service() {
     .await;
 }
 
-#[cfg(feature = "http")]
+#[cfg(feature = "websocket")]
 #[tokio::test]
 async fn a_refused_upgrade_returns_the_status_of_the_service() {
     let edge = FakeEdge::start();
