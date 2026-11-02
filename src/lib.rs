@@ -6,11 +6,16 @@
 //! use cf_tunnel_rs::{ClientConfig, Token, TunnelClient};
 //!
 //! let token: Token = std::env::var("TUNNEL_TOKEN").unwrap().parse()?;
-//! let client = TunnelClient::connect(ClientConfig::new(token, "198.41.192.167:7844".parse().unwrap())).await?;
-//! while let Ok(stream) = client.accept().await {
-//!     println!("{} {}", stream.request().dest, stream.request().http_method().unwrap_or("-"));
+//! let edge = "198.41.192.167:7844".parse().unwrap();
+//! let client = TunnelClient::connect(ClientConfig::new(token, edge)).await?;
+//! loop {
+//!     let (request, _body, responder) = client.accept().await?.split();
+//!     let text = format!("{} {}\n", request.http_method().unwrap_or("-"), request.dest);
+//!     let mut out = responder.respond_http(200, [("Content-Type", "text/plain")]).await?;
+//!     out.write_all(text.as_bytes()).await.ok();
+//!     out.finish().ok();
 //! }
-//! # Ok(()) }
+//! # }
 //! ```
 
 mod client;
@@ -30,5 +35,5 @@ mod quic_metadata_protocol_capnp {
 
 pub use client::{ClientConfig, ConnectionDetails, TunnelClient};
 pub use error::Error;
-pub use stream::{ConnectRequest, IncomingStream, Responder, StreamIo, StreamKind, header_key};
+pub use stream::{ConnectRequest, IncomingStream, Responder, StreamKind};
 pub use token::Token;

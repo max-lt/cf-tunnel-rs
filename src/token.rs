@@ -53,3 +53,50 @@ impl fmt::Debug for Token {
             .finish_non_exhaustive()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use base64::{Engine, engine::general_purpose::STANDARD};
+
+    use super::*;
+
+    fn encode(json: &str) -> String {
+        STANDARD.encode(json)
+    }
+
+    #[test]
+    fn parses_and_ignores_the_endpoint_key() {
+        let id = Uuid::new_v4();
+        let json = format!(
+            r#"{{"a":"acct","s":"{}","t":"{id}","e":"fed"}}"#,
+            STANDARD.encode(b"hunter2")
+        );
+        let token: Token = encode(&json).parse().unwrap();
+        assert_eq!(token.account_tag, "acct");
+        assert_eq!(token.secret, b"hunter2");
+        assert_eq!(token.tunnel_id(), id);
+    }
+
+    #[test]
+    fn debug_hides_the_secret() {
+        let json = format!(
+            r#"{{"a":"acct","s":"{}","t":"{}"}}"#,
+            STANDARD.encode(b"hunter2"),
+            Uuid::new_v4()
+        );
+        let token: Token = encode(&json).parse().unwrap();
+        let shown = format!("{token:?}");
+        assert!(!shown.contains("hunter2") && !shown.contains("acct"));
+    }
+
+    #[test]
+    fn rejects_bad_input() {
+        assert!("not base64!".parse::<Token>().is_err());
+        assert!(encode("{}").parse::<Token>().is_err());
+        assert!(
+            encode(r#"{"a":"x","s":"!!","t":"nope"}"#)
+                .parse::<Token>()
+                .is_err()
+        );
+    }
+}

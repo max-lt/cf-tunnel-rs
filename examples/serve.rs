@@ -1,9 +1,16 @@
 //! Register one connection with the edge, then relay HTTP requests to ORIGIN.
 //! Usage: set -a; . ./.env; set +a; EDGE_ADDR=<ip>:7844 cargo run --example serve
 
-use anyhow::{Context, Result};
-use cf_tunnel_rs::{ClientConfig, IncomingStream, StreamKind, TunnelClient, header_key};
+use std::time::Duration;
+
+use anyhow::{Context, Result, bail};
+use cf_tunnel_rs::{ClientConfig, ConnectRequest, IncomingStream, StreamKind, TunnelClient};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+const GRACE: Duration = Duration::from_secs(3);
+/// Headers that describe the hop to the origin, not the request itself.
+const REQUEST_HOP_HEADERS: [&str; 4] = ["host", "connection", "upgrade", "transfer-encoding"];
+const RESPONSE_HOP_HEADERS: [&str; 3] = ["connection", "keep-alive", "transfer-encoding"];
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
@@ -23,98 +30,124 @@ async fn main() -> Result<()> {
     );
     eprintln!("serving origin {origin}; Ctrl-C to stop");
 
-    loop {
+    let result = loop {
         tokio::select! {
-            stream = client.accept() => {
-                let origin = origin.clone();
-                tokio::spawn(async move {
-                    if let Err(e) = proxy(stream?, &origin).await {
-                        eprintln!("stream: {e:#}");
-                    }
-                    anyhow::Ok(())
-                });
-            }
-            _ = tokio::signal::ctrl_c() => break,
+            stream = client.accept() => match stream {
+                Ok(stream) => {
+                    let origin = origin.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = proxy(stream, &origin).await {
+                            eprintln!("stream: {e:#}");
+                        }
+                    });
+                }
+                Err(e) => break Err(e.into()),
+            },
+            _ = tokio::signal::ctrl_c() => break Ok(()),
         }
-    }
-    client.shutdown().await;
-    Ok(())
+    };
+    client.shutdown(GRACE).await;
+    result
 }
 
 async fn proxy(stream: IncomingStream, origin: &str) -> Result<()> {
     let (request, mut body, responder) = stream.split();
     if request.kind != StreamKind::Http {
-        responder.reject("only http is supported", &[]).await?;
+        responder.reject("only http is supported").await?;
         return Ok(());
     }
-    let line = format!(
-        "{} {}",
-        request.http_method().unwrap_or("GET"),
-        request.http_path()
-    );
+    let method = request.http_method().unwrap_or("GET");
+    let target = request.http_path();
+    // The query can carry access tokens, so it stays out of the logs.
+    let line = format!("{method} {}", target.split('?').next().unwrap_or("/"));
+    let Some(body_len) = request_body_len(&request) else {
+        responder
+            .reject("chunked request bodies are not supported")
+            .await?;
+        bail!("{line}: chunked request body");
+    };
     let mut upstream = match tokio::net::TcpStream::connect(origin).await {
         Ok(s) => s,
         Err(e) => {
-            let status = [("HttpStatus".to_owned(), "502".to_owned())];
-            responder.reject(&e.to_string(), &status).await?;
-            anyhow::bail!("{line}: origin {origin}: {e}");
+            responder.reject(&e.to_string()).await?;
+            bail!("{line}: origin {origin}: {e}");
         }
     };
 
     // HTTP/1.0 keeps the origin response free of chunked encoding.
     let mut head = format!(
-        "{line} HTTP/1.0\r\nHost: {}\r\n",
+        "{method} {target} HTTP/1.0\r\nHost: {}\r\n",
         request.http_host().unwrap_or("")
     );
-    let mut body_len = 0u64;
     for (name, val) in request.http_headers() {
-        match name.to_ascii_lowercase().as_str() {
-            "host" | "connection" | "upgrade" | "transfer-encoding" => continue,
-            "content-length" => body_len = val.parse().unwrap_or(0),
-            _ => {}
+        if !REQUEST_HOP_HEADERS.contains(&name.to_ascii_lowercase().as_str()) {
+            head.push_str(&format!("{name}: {val}\r\n"));
         }
-        head.push_str(&format!("{name}: {val}\r\n"));
     }
     head.push_str("\r\n");
     upstream.write_all(head.as_bytes()).await?;
-    if body_len > 0 {
-        tokio::io::copy(&mut (&mut body).take(body_len), &mut upstream).await?;
-    }
+    tokio::io::copy(&mut (&mut body).take(body_len), &mut upstream).await?;
 
-    // Read the response head before accepting, so the status is known.
+    let (status, headers, leftover) = read_response_head(&mut upstream)
+        .await
+        .with_context(|| line.clone())?;
+    let headers: Vec<(&str, &str)> = headers
+        .iter()
+        .map(|(n, v)| (n.as_str(), v.as_str()))
+        .collect();
+    let mut to_edge = responder.respond_http(status, headers).await?;
+    to_edge.write_all(&leftover).await?;
+    tokio::io::copy(&mut upstream, &mut to_edge).await?;
+    to_edge.finish()?;
+    eprintln!("{line} -> {status}");
+    Ok(())
+}
+
+/// Length of the request body, or `None` when it is chunked.
+fn request_body_len(request: &ConnectRequest) -> Option<u64> {
+    let mut len = 0;
+    for (name, val) in request.http_headers() {
+        if name.eq_ignore_ascii_case("transfer-encoding")
+            && val.to_ascii_lowercase().contains("chunked")
+        {
+            return None;
+        }
+        if name.eq_ignore_ascii_case("content-length") {
+            len = val.parse().unwrap_or(0);
+        }
+    }
+    Some(len)
+}
+
+/// Reads until the response head is complete. Returns the status, the
+/// forwardable headers and the body bytes already read.
+async fn read_response_head(
+    upstream: &mut tokio::net::TcpStream,
+) -> Result<(u16, Vec<(String, String)>, Vec<u8>)> {
     let mut buf = Vec::new();
-    let (status, meta, body_start) = loop {
+    loop {
         let mut chunk = [0u8; 8192];
         let n = upstream.read(&mut chunk).await?;
         if n == 0 {
-            anyhow::bail!("{line}: origin closed before sending headers");
+            bail!("origin closed before sending headers");
         }
         buf.extend_from_slice(&chunk[..n]);
         let mut parsed = [httparse::EMPTY_HEADER; 64];
         let mut response = httparse::Response::new(&mut parsed);
-        if let httparse::Status::Complete(end) = response.parse(&buf)? {
-            let status = response.code.unwrap_or(502);
-            let mut meta = vec![("HttpStatus".to_owned(), status.to_string())];
-            for h in response.headers.iter() {
-                if matches!(
-                    h.name.to_ascii_lowercase().as_str(),
-                    "connection" | "keep-alive" | "transfer-encoding"
-                ) {
-                    continue;
-                }
-                meta.push((
-                    header_key(h.name),
+        let httparse::Status::Complete(end) = response.parse(&buf)? else {
+            continue;
+        };
+        let headers = response
+            .headers
+            .iter()
+            .filter(|h| !RESPONSE_HOP_HEADERS.contains(&h.name.to_ascii_lowercase().as_str()))
+            .map(|h| {
+                (
+                    h.name.to_owned(),
                     String::from_utf8_lossy(h.value).into_owned(),
-                ));
-            }
-            break (status, meta, end);
-        }
-    };
-
-    let mut to_edge = responder.accept(&meta).await?;
-    to_edge.write_all(&buf[body_start..]).await?;
-    tokio::io::copy(&mut upstream, &mut to_edge).await?;
-    to_edge.shutdown().await?;
-    eprintln!("{line} -> {status}");
-    Ok(())
+                )
+            })
+            .collect();
+        return Ok((response.code.unwrap_or(502), headers, buf.split_off(end)));
+    }
 }

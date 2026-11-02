@@ -1,9 +1,13 @@
-use std::{net::SocketAddr, sync::Arc, time::Duration};
+use std::{
+    net::{Ipv4Addr, Ipv6Addr, SocketAddr},
+    sync::Arc,
+    time::Duration,
+};
 
 use capnp_rpc::{RpcSystem, rpc_twoparty_capnp::Side, twoparty};
 use quinn::{RecvStream, SendStream};
 use rustls::pki_types::{CertificateDer, pem::PemObject};
-use tokio::sync::oneshot;
+use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 use uuid::Uuid;
 
@@ -15,14 +19,24 @@ use crate::{
 const SERVER_NAME: &str = "quic.cftunnel.com";
 const ALPN: &[u8] = b"argotunnel";
 const ROOTS: &[u8] = include_bytes!("../roots/cloudflare-origin-ca.crt");
+const REGISTER_TIMEOUT: Duration = Duration::from_secs(10);
+const UNREGISTER_TIMEOUT: Duration = Duration::from_secs(5);
+const PREAMBLE_TIMEOUT: Duration = Duration::from_secs(10);
+const STREAM_QUEUE: usize = 64;
+// The edge opens one stream per request, so quinn's default of 100 would stall it.
+// quinn allocates state for every allowed stream up front, so the limit stays bounded.
+const MAX_BIDI_STREAMS: quinn::VarInt = quinn::VarInt::from_u32(10_000);
 
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct ClientConfig {
     pub token: Token,
     /// Edge address, usually port 7844.
     pub edge: SocketAddr,
     /// Index of this connection among the tunnel's connections.
     pub conn_index: u8,
+    /// Identifies this process to the edge. Connections of one process share it.
+    pub client_id: Uuid,
     /// Reported to the edge as the client version.
     pub version: String,
 }
@@ -33,6 +47,7 @@ impl ClientConfig {
             token,
             edge,
             conn_index: 0,
+            client_id: Uuid::new_v4(),
             version: concat!("cf-tunnel-rs-", env!("CARGO_PKG_VERSION")).to_owned(),
         }
     }
@@ -48,21 +63,28 @@ pub struct ConnectionDetails {
 }
 
 /// One registered connection to the edge.
+///
+/// Registration runs on a dedicated thread with its own runtime, because
+/// `capnp-rpc` is not `Send`. Call [`shutdown`](Self::shutdown) to unregister
+/// before closing. Dropping the client unregisters on a best-effort basis and
+/// closes the QUIC connection without a grace period.
 pub struct TunnelClient {
     endpoint: quinn::Endpoint,
     conn: quinn::Connection,
     details: ConnectionDetails,
-    shutdown: Option<oneshot::Sender<()>>,
-    done: Option<oneshot::Receiver<()>>,
+    incoming: Mutex<mpsc::Receiver<IncomingStream>>,
+    shutdown: oneshot::Sender<()>,
+    done: oneshot::Receiver<()>,
 }
 
 impl TunnelClient {
     /// Dials the edge and registers the connection.
     pub async fn connect(config: ClientConfig) -> Result<Self, Error> {
-        let mut endpoint = quinn::Endpoint::client(match config.edge {
-            SocketAddr::V4(_) => "0.0.0.0:0".parse().unwrap(),
-            SocketAddr::V6(_) => "[::]:0".parse().unwrap(),
-        })?;
+        let bind: SocketAddr = match config.edge {
+            SocketAddr::V4(_) => (Ipv4Addr::UNSPECIFIED, 0).into(),
+            SocketAddr::V6(_) => (Ipv6Addr::UNSPECIFIED, 0).into(),
+        };
+        let mut endpoint = quinn::Endpoint::client(bind)?;
         endpoint.set_default_client_config(quic_config()?);
         let conn = endpoint.connect(config.edge, SERVER_NAME)?.await?;
         let (send, recv) = conn.open_bi().await?;
@@ -70,7 +92,6 @@ impl TunnelClient {
         let (ready_tx, ready_rx) = oneshot::channel();
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let (done_tx, done_rx) = oneshot::channel();
-        // capnp-rpc is not Send, so the control stream runs on its own thread.
         std::thread::Builder::new()
             .name("cf-tunnel-control".into())
             .spawn(move || {
@@ -93,11 +114,12 @@ impl TunnelClient {
             .await
             .map_err(|_| Error::Protocol("control thread ended before registration".into()))??;
         Ok(Self {
+            incoming: Mutex::new(spawn_acceptor(conn.clone())),
             endpoint,
             conn,
             details,
-            shutdown: Some(shutdown_tx),
-            done: Some(done_rx),
+            shutdown: shutdown_tx,
+            done: done_rx,
         })
     }
 
@@ -105,15 +127,12 @@ impl TunnelClient {
         &self.details
     }
 
-    /// Waits for the next request stream from the edge.
+    /// Waits for the next request stream from the edge. Safe to cancel.
+    /// Fails once the connection has ended.
     pub async fn accept(&self) -> Result<IncomingStream, Error> {
-        loop {
-            let (send, recv) = self.conn.accept_bi().await?;
-            match IncomingStream::read(send, recv).await {
-                Ok(Some(stream)) => return Ok(stream),
-                Ok(None) => tracing::debug!("dropped edge RPC stream"),
-                Err(e) => tracing::debug!("dropped malformed stream: {e}"),
-            }
+        match self.incoming.lock().await.recv().await {
+            Some(stream) => Ok(stream),
+            None => Err(self.conn.closed().await.into()),
         }
     }
 
@@ -122,21 +141,52 @@ impl TunnelClient {
         self.conn.closed().await.into()
     }
 
-    /// Unregisters from the edge and closes the connection.
-    pub async fn shutdown(mut self) {
-        drop(self.shutdown.take());
-        if let Some(done) = self.done.take() {
-            let _ = tokio::time::timeout(Duration::from_secs(5), done).await;
-        }
-        self.conn.close(0u32.into(), b"");
-        self.endpoint.wait_idle().await;
+    /// Unregisters from the edge, then waits up to `grace` for the edge to
+    /// close the connection. Requests in flight keep running during the wait.
+    pub async fn shutdown(self, grace: Duration) {
+        let Self {
+            endpoint,
+            conn,
+            shutdown,
+            done,
+            ..
+        } = self;
+        drop(shutdown);
+        let _ = tokio::time::timeout(UNREGISTER_TIMEOUT, done).await;
+        let _ = tokio::time::timeout(grace, conn.closed()).await;
+        conn.close(0u32.into(), b"");
+        endpoint.wait_idle().await;
     }
 }
 
-impl Drop for TunnelClient {
-    fn drop(&mut self) {
-        self.conn.close(0u32.into(), b"");
-    }
+/// Reads each stream's preamble in its own task, so a silent peer blocks
+/// nothing. The task ends when the client is dropped or the connection closes.
+fn spawn_acceptor(conn: quinn::Connection) -> mpsc::Receiver<IncomingStream> {
+    let (tx, rx) = mpsc::channel(STREAM_QUEUE);
+    tokio::spawn(async move {
+        loop {
+            let (send, recv) = tokio::select! {
+                accepted = conn.accept_bi() => match accepted {
+                    Ok(streams) => streams,
+                    Err(_) => return,
+                },
+                _ = tx.closed() => return,
+            };
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                let read = tokio::time::timeout(PREAMBLE_TIMEOUT, IncomingStream::read(send, recv));
+                match read.await {
+                    Ok(Ok(Some(stream))) => {
+                        let _ = tx.send(stream).await;
+                    }
+                    Ok(Ok(None)) => tracing::debug!("dropped edge RPC stream"),
+                    Ok(Err(e)) => tracing::debug!("dropped malformed stream: {e}"),
+                    Err(_) => tracing::debug!("dropped stream with no request"),
+                }
+            });
+        }
+    });
+    rx
 }
 
 fn root_store() -> Result<rustls::RootCertStore, Error> {
@@ -149,12 +199,11 @@ fn root_store() -> Result<rustls::RootCertStore, Error> {
 }
 
 fn quic_config() -> Result<quinn::ClientConfig, Error> {
-    let roots = root_store()?;
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let mut tls = rustls::ClientConfig::builder_with_provider(provider)
         .with_protocol_versions(&[&rustls::version::TLS13])
         .map_err(|e| Error::Tls(e.to_string()))?
-        .with_root_certificates(roots)
+        .with_root_certificates(root_store()?)
         .with_no_client_auth();
     tls.alpn_protocols = vec![ALPN.to_vec()];
 
@@ -166,6 +215,7 @@ fn quic_config() -> Result<quinn::ClientConfig, Error> {
             .expect("5 s fits an idle timeout"),
     ));
     transport.initial_mtu(1232);
+    transport.max_concurrent_bidi_streams(MAX_BIDI_STREAMS);
     let crypto = quinn::crypto::rustls::QuicClientConfig::try_from(tls)
         .map_err(|e| Error::Tls(e.to_string()))?;
     let mut config = quinn::ClientConfig::new(Arc::new(crypto));
@@ -191,7 +241,14 @@ async fn control(
     let client: registration_server::Client = rpc.bootstrap(Side::Server);
     tokio::task::spawn_local(rpc);
 
-    let _ = ready.send(register(&client, &config).await);
+    let registered = tokio::time::timeout(REGISTER_TIMEOUT, register(&client, &config))
+        .await
+        .unwrap_or(Err(Error::RegistrationTimeout));
+    let ok = registered.is_ok();
+    let _ = ready.send(registered);
+    if !ok {
+        return;
+    }
     let _ = shutdown.await;
     let _ = client.unregister_connection_request().send().promise.await;
 }
@@ -210,7 +267,7 @@ async fn register(
         params.set_conn_index(config.conn_index);
         let mut options = params.init_options();
         let mut info = options.reborrow().init_client();
-        info.set_client_id(Uuid::new_v4().as_bytes());
+        info.set_client_id(config.client_id.as_bytes());
         info.set_version(config.version.as_str());
         info.set_arch(std::env::consts::ARCH);
     }

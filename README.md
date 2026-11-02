@@ -10,3 +10,5 @@ See [PROTOCOL.md](PROTOCOL.md).
 License: MIT OR Apache-2.0.
 
 The files in `schema/` and `roots/` come from `cloudflare/cloudflared` (Apache-2.0).
+
+Building needs the `capnp` compiler on the PATH (for example `brew install capnp`).

@@ -18,7 +18,9 @@ client to deliver requests. The client never listens on a public port.
 - ALPN: `argotunnel`.
 - Probe connections use server name `probe.cftunnel.com`, same ALPN.
 - The server certificate is checked against the system roots plus the
-  Cloudflare Origin CA roots (`tlsconfig/cloudflare_ca.go`).
+  Cloudflare Origin CA roots (`tlsconfig/cloudflare_ca.go`). The `--cacert`
+  flag replaces both sets (`tlsconfig/origin_ca.go`). This crate checks only
+  the Cloudflare roots.
 - An HTTP/2 transport exists (server name `h2.cftunnel.com`). It is out of scope.
 
 Key exchange (`crypto/curves.go`). The default mode offers these groups in
@@ -60,6 +62,7 @@ A tunnel token string is standard base64 of a JSON object
 | `a` | string | Account tag |
 | `s` | bytes | Tunnel secret |
 | `t` | UUID | Tunnel ID |
+| `e` | string | Endpoint, optional (for example `fed`) |
 
 The registration call sends `TunnelAuth { accountTag, tunnelSecret }` and the
 tunnel ID.
@@ -112,7 +115,9 @@ After a successful registration, if `connIndex` is 0 and
 (`connection/control.go`).
 
 On graceful shutdown the client calls `unregisterConnection`. It waits at most
-the grace period for the reply.
+the grace period for the reply. After the control stream ends, `cloudflared`
+keeps accepting streams for the whole grace period, then closes the
+connection (`connection/quic_connection.go`, `Serve`).
 
 ### 5.2 Feature strings
 
@@ -128,12 +133,18 @@ The client removes deprecated strings (`serialized_headers`, `quick_reconnects`,
 `support_datagram_v3`, `support_datagram_v3_1`) before it sends the list.
 
 `cloudflared` picks the datagram version from a user flag first. Otherwise it
-reads a percentage from the TXT record `cfd-features.argotunnel.com` (a JSON
-object, refreshed on a timer). The same record has a `SkipPrechecks` switch.
+reads the TXT record `cfd-features.argotunnel.com` (`features/selector.go`).
+The record is a JSON object. The lookup times out after 10 s and repeats every
+hour. Unknown keys are ignored.
+
+| Key | Type | Meaning |
+| --- | --- | --- |
+| `dv3_2` | u32 | Datagram v3 is on when the value is greater than the account hash |
+| `skip_prechecks` | bool | Skips the startup connectivity checks |
 
 ### 5.3 Observed behavior
 
-Tested with `examples/spike.rs` against `198.41.192.167:7844` (`region1`),
+Tested with `examples/serve.rs` against `198.41.192.167:7844` (`region1`),
 a remotely managed tunnel:
 
 - The handshake succeeds with TLS 1.3, `ring`, ALPN `argotunnel` and the
@@ -152,6 +163,10 @@ Tested with `examples/serve.rs` and a published application
 - The client can read the request body before it sends the response. An
   origin that waits for the body needs this.
 - The edge sent no RPC stream during the test. The client ignores RPC streams.
+- The edge also opens data streams for management requests, for example
+  `GET /host_details?connector_id=<uuid>&access_token=<jwt>`. `cloudflared`
+  answers them with its management service (`management/service.go`). The URL
+  carries a token, so a client must not log it.
 - The edge picks the connection for each request. The client does not route.
 - The `dest` field holds the public URL. The client picks the origin itself.
 
@@ -196,6 +211,7 @@ Metadata keys (`connection/quic_connection.go`):
 | `HttpHeader:<Name>` | both | One header value per entry |
 | `HttpStatus` | response | Status code |
 | `FlowID` | request, tcp | Flow identifier |
+| `cf-trace-id` | request, tcp | Trace context (`tracing/tracing.go`) |
 | `FlowConnectRateLimited` | response | `true` when the flow limit is hit |
 
 Rules:
@@ -205,8 +221,9 @@ Rules:
   parts. The client rejects any other key.
 - HTTP responses send `ConnectResponse` once, with `HttpStatus` and headers.
   Body bytes follow on the same stream.
-- A non-empty `error` means the request failed. The client sends it with
-  `HttpStatus` 502 for HTTP.
+- A non-empty `error` means the request failed. On QUIC, `cloudflared` sends
+  the error text and no `HttpStatus` (`handleDataStream`). The only extra
+  metadata is `FlowConnectRateLimited`.
 - For tcp, the client sends an empty `ConnectResponse` to accept. Bytes flow in
   both directions after that.
 - Trailers are not supported.
@@ -287,7 +304,8 @@ on Windows. The maximum UDP payload is 1280 bytes on unix.
 - Region selection (`edgediscovery/allregions/region.go`, `regions.go`).
 - ICMP datagrams (`quic/v3/icmp.go`).
 - The trace ID length in version 2 IP packets with trace.
-- The JSON key names of the `cfd-features.argotunnel.com` record.
 - Retry and backoff policy (`supervisor/`).
 - Why `go.mod` replaces `quic-go` with a fork (`chungthuang/quic-go`).
-- Whether `capnp-rpc` (Rust) interoperates with the Go RPC library.
+- The meaning of `originLocalIp` and `numPreviousAttempts`. This crate sends
+  neither.
+- The tracing header that a tcp acknowledgement can carry.
