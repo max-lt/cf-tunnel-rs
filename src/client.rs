@@ -4,17 +4,12 @@ use std::{
     time::Duration,
 };
 
-use capnp_rpc::{RpcSystem, rpc_twoparty_capnp::Side, twoparty};
 use quinn::{RecvStream, SendStream};
 use rustls::pki_types::{CertificateDer, pem::PemObject};
-use tokio::sync::{Mutex, mpsc, oneshot};
-use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
+use tokio::sync::{Mutex, mpsc};
 use uuid::Uuid;
 
-use crate::{
-    Error, IncomingStream, Token,
-    tunnelrpc_capnp::{connection_response, registration_server},
-};
+use crate::{Error, IncomingStream, Token, control::Control};
 
 const SERVER_NAME: &str = "quic.cftunnel.com";
 const ALPN: &[u8] = b"argotunnel";
@@ -64,17 +59,14 @@ pub struct ConnectionDetails {
 
 /// One registered connection to the edge.
 ///
-/// Registration runs on a dedicated thread with its own runtime, because
-/// `capnp-rpc` is not `Send`. Call [`shutdown`](Self::shutdown) to unregister
-/// before closing. Dropping the client unregisters on a best-effort basis and
-/// closes the QUIC connection without a grace period.
+/// Call [`shutdown`](Self::shutdown) to unregister before closing. Dropping the
+/// client closes the QUIC connection without unregistering.
 pub struct TunnelClient {
     endpoint: quinn::Endpoint,
     conn: quinn::Connection,
     details: ConnectionDetails,
     incoming: Mutex<mpsc::Receiver<IncomingStream>>,
-    shutdown: oneshot::Sender<()>,
-    done: oneshot::Receiver<()>,
+    control: Control<RecvStream, SendStream>,
 }
 
 impl TunnelClient {
@@ -93,41 +85,23 @@ impl TunnelClient {
         // The edge treats the first stream as the control stream.
         let (send, recv) = conn.open_bi().await?;
 
-        let (ready_tx, ready_rx) = oneshot::channel();
-        let (shutdown_tx, shutdown_rx) = oneshot::channel();
-        let (done_tx, done_rx) = oneshot::channel();
+        // Bootstrap and registration share one deadline.
+        let registered = tokio::time::timeout(REGISTER_TIMEOUT, async {
+            let mut control = Control::bootstrap(recv, send).await?;
+            let details = control.register(&config).await?;
 
-        // capnp-rpc is not Send, so the control stream gets its own thread.
-        std::thread::Builder::new()
-            .name("cf-tunnel-control".into())
-            .spawn(move || {
-                let runtime = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .expect("build control runtime");
-                let local = tokio::task::LocalSet::new();
-                runtime.block_on(local.run_until(control(
-                    send,
-                    recv,
-                    config,
-                    ready_tx,
-                    shutdown_rx,
-                )));
-                let _ = done_tx.send(());
-            })?;
-
-        // Wait for the registration result from the control thread.
-        let details = ready_rx
-            .await
-            .map_err(|_| Error::Protocol("control thread ended before registration".into()))??;
+            Ok::<_, Error>((control, details))
+        })
+        .await
+        .map_err(|_| Error::RegistrationTimeout)??;
+        let (control, details) = registered;
 
         Ok(Self {
             incoming: Mutex::new(spawn_acceptor(conn.clone())),
             endpoint,
             conn,
             details,
-            shutdown: shutdown_tx,
-            done: done_rx,
+            control,
         })
     }
 
@@ -155,14 +129,12 @@ impl TunnelClient {
         let Self {
             endpoint,
             conn,
-            shutdown,
-            done,
+            mut control,
             ..
         } = self;
 
-        // Dropping the sender tells the control thread to unregister.
-        drop(shutdown);
-        let _ = tokio::time::timeout(UNREGISTER_TIMEOUT, done).await;
+        // The edge may close the connection instead of answering.
+        let _ = tokio::time::timeout(UNREGISTER_TIMEOUT, control.unregister()).await;
 
         // The edge closes the connection after unregister. Wait for it so
         // requests in flight can finish.
@@ -250,85 +222,6 @@ fn quic_config() -> Result<quinn::ClientConfig, Error> {
     config.transport_config(Arc::new(transport));
 
     Ok(config)
-}
-
-/// Registers the connection, reports the result, and unregisters on shutdown.
-async fn control(
-    send: SendStream,
-    recv: RecvStream,
-    config: ClientConfig,
-    ready: oneshot::Sender<Result<ConnectionDetails, Error>>,
-    shutdown: oneshot::Receiver<()>,
-) {
-    // Run the RPC system on the control stream, with the edge as bootstrap.
-    let network = twoparty::VatNetwork::new(
-        recv.compat(),
-        send.compat_write(),
-        Side::Client,
-        Default::default(),
-    );
-    let mut rpc = RpcSystem::new(Box::new(network), None);
-    let client: registration_server::Client = rpc.bootstrap(Side::Server);
-    tokio::task::spawn_local(rpc);
-
-    let registered = tokio::time::timeout(REGISTER_TIMEOUT, register(&client, &config))
-        .await
-        .unwrap_or(Err(Error::RegistrationTimeout));
-    let ok = registered.is_ok();
-    let _ = ready.send(registered);
-
-    // After a failed registration there is nothing to unregister.
-    if !ok {
-        return;
-    }
-
-    let _ = shutdown.await;
-    let _ = client.unregister_connection_request().send().promise.await;
-}
-
-async fn register(
-    client: &registration_server::Client,
-    config: &ClientConfig,
-) -> Result<ConnectionDetails, Error> {
-    let mut request = client.register_connection_request();
-
-    // Fill in the credentials and the client description.
-    {
-        let mut params = request.get();
-        let mut auth = params.reborrow().init_auth();
-        auth.set_account_tag(config.token.account_tag.as_str());
-        auth.set_tunnel_secret(&config.token.secret);
-        params.set_tunnel_id(config.token.tunnel_id.as_bytes());
-        params.set_conn_index(config.conn_index);
-        let mut options = params.init_options();
-        let mut info = options.reborrow().init_client();
-        info.set_client_id(config.client_id.as_bytes());
-        info.set_version(config.version.as_str());
-        info.set_arch(std::env::consts::ARCH);
-    }
-
-    let reply = request.send().promise.await?;
-
-    // The edge answers with either the connection details or a refusal.
-    match reply.get()?.get_result()?.get_result().which()? {
-        connection_response::result::Which::ConnectionDetails(details) => {
-            let details = details?;
-            Ok(ConnectionDetails {
-                uuid: Uuid::from_slice(details.get_uuid()?)
-                    .map_err(|e| Error::Protocol(e.to_string()))?,
-                location: details.get_location_name()?.to_str()?.to_owned(),
-                remotely_managed: details.get_tunnel_is_remotely_managed(),
-            })
-        }
-        connection_response::result::Which::Error(error) => {
-            let error = error?;
-            Err(Error::Refused {
-                cause: error.get_cause()?.to_str()?.to_owned(),
-                retry_after: Duration::from_nanos(error.get_retry_after().max(0) as u64),
-                should_retry: error.get_should_retry(),
-            })
-        }
-    }
 }
 
 #[cfg(test)]

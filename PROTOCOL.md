@@ -82,7 +82,7 @@ connection to one edge address.
 
 ### 5.1 Registration RPC
 
-Schema: `tunnelrpc/proto/tunnelrpc.capnp`. Interface `RegistrationServer`
+Schema: `tunnelrpc/proto/tunnelrpc.capnp` (a copy is in `tests/schema`). Interface `RegistrationServer`
 (`@0xf71695ec7fe85497`):
 
 | Ordinal | Method | Params | Result |
@@ -149,8 +149,12 @@ a remotely managed tunnel:
 
 - The handshake succeeds with TLS 1.3, `ring`, ALPN `argotunnel` and the
   Cloudflare Origin CA roots only. No post-quantum group is needed.
-- `capnp-rpc` 0.27 and the edge interoperate. `registerConnection` returns
-  `ConnectionDetails` (`locationName` `mrs04`, `tunnelIsRemotelyManaged` true).
+- The RPC needs only four messages: `Bootstrap`, `Call`, `Return` and `Finish`.
+  The client sends `Bootstrap`, then `Call` with interface `0xf71695ec7fe85497`
+  (method 0 registers, method 1 unregisters). The edge answers with `Return`.
+  `registerConnection` returns `ConnectionDetails` (`locationName` `mrs04`,
+  `tunnelIsRemotelyManaged` true). The edge accepts messages written by this
+  crate, so a full RPC engine is not needed.
 - The connection stays open for at least 12 s with a 1 s keep-alive.
 - `unregisterConnection` gets no RPC reply. The edge closes the QUIC
   connection with application error code 0.

@@ -8,9 +8,6 @@ description = "Client library for Cloudflare Tunnel over QUIC"
 
 [dependencies]
 base64 = "0.23.1"
-capnp = "0.27.3"
-capnp-futures = "0.27.0"
-capnp-rpc = "0.27.2"
 hickory-resolver = { version = "0.26", features = ["tls-ring", "webpki-roots"] }
 quinn = "0.11"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
@@ -18,12 +15,8 @@ serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 thiserror = "2.0.21"
 tokio = { version = "1", features = ["rt", "time", "sync", "io-util", "macros"] }
-tokio-util = { version = "0.7.20", features = ["compat"] }
 tracing = "0.1.44"
 uuid = { version = "1.29.0", features = ["v4", "serde"] }
-
-[build-dependencies]
-capnpc = "0.27.0"
 
 [dev-dependencies]
 anyhow = "1.0.104"

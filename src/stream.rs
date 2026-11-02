@@ -1,11 +1,10 @@
 use std::borrow::Cow;
 
 use quinn::{RecvStream, SendStream};
-use tokio_util::compat::TokioAsyncReadCompatExt;
 
 use crate::{
     Error,
-    quic_metadata_protocol_capnp::{ConnectionType, connect_request, connect_response},
+    wire::{self, Builder, Message},
 };
 
 const DATA_SIGNATURE: [u8; 6] = [0x0A, 0x36, 0xCD, 0x12, 0xA1, 0x3E];
@@ -13,6 +12,11 @@ const RPC_SIGNATURE: [u8; 6] = [0x52, 0xBB, 0x82, 0x5C, 0xDB, 0x65];
 const VERSION: [u8; 2] = *b"01";
 const HEADER_PREFIX: &str = "HttpHeader:";
 const STATUS_KEY: &str = "HttpStatus";
+
+/// Values of the `ConnectionType` enum.
+const HTTP: u16 = 0;
+const WEBSOCKET: u16 = 1;
+const TCP: u16 = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
@@ -104,9 +108,7 @@ impl IncomingStream {
             return Err(Error::Protocol(format!("unknown version {version:02x?}")));
         }
 
-        let message =
-            capnp_futures::serialize::read_message((&mut recv).compat(), Default::default())
-                .await?;
+        let message = wire::read_message(&mut recv).await?;
 
         Ok(Some(Self {
             request: parse_request(&message)?,
@@ -126,28 +128,26 @@ impl IncomingStream {
     }
 }
 
-fn parse_request<S: capnp::message::ReaderSegments>(
-    message: &capnp::message::Reader<S>,
-) -> Result<ConnectRequest, Error> {
-    let root = message.get_root::<connect_request::Reader>()?;
+/// Reads a `ConnectRequest`: `dest` (pointer 0), `type` (u16 at byte 0) and
+/// `metadata` (pointer 1, a list of key-value structs).
+pub(crate) fn parse_request(message: &Message) -> Result<ConnectRequest, Error> {
+    let root = message.root()?;
 
-    let kind = match root.get_type()? {
-        ConnectionType::Http => StreamKind::Http,
-        ConnectionType::Websocket => StreamKind::WebSocket,
-        ConnectionType::Tcp => StreamKind::Tcp,
+    let kind = match root.u16(0) {
+        HTTP => StreamKind::Http,
+        WEBSOCKET => StreamKind::WebSocket,
+        TCP => StreamKind::Tcp,
+        other => return Err(Error::Protocol(format!("unknown connection type {other}"))),
     };
 
     // Copy the key-value entries out of the message.
     let mut metadata = Vec::new();
-    for entry in root.get_metadata()? {
-        metadata.push((
-            entry.get_key()?.to_str()?.to_owned(),
-            entry.get_val()?.to_str()?.to_owned(),
-        ));
+    for entry in root.struct_list(1)?.iter() {
+        metadata.push((entry.text(0)?.to_owned(), entry.text(1)?.to_owned()));
     }
 
     Ok(ConnectRequest {
-        dest: root.get_dest()?.to_str()?.to_owned(),
+        dest: root.text(0)?.to_owned(),
         kind,
         metadata,
     })
@@ -166,6 +166,7 @@ impl Responder {
     /// Sends a success response with raw metadata entries.
     pub async fn accept(mut self, metadata: &[(&str, &str)]) -> Result<SendStream, Error> {
         self.send.write_all(&response_bytes(None, metadata)).await?;
+
         Ok(self.send)
     }
 
@@ -194,35 +195,36 @@ impl Responder {
             .write_all(&response_bytes(Some(error), &[]))
             .await?;
         self.send.finish().ok();
+
         Ok(())
     }
 }
 
-/// Preamble followed by one `ConnectResponse` message.
-fn response_bytes(error: Option<&str>, metadata: &[(&str, &str)]) -> Vec<u8> {
-    let mut message = capnp::message::Builder::new_default();
+/// Preamble followed by one `ConnectResponse`: `error` (pointer 0) and
+/// `metadata` (pointer 1).
+pub(crate) fn response_bytes(error: Option<&str>, metadata: &[(&str, &str)]) -> Vec<u8> {
+    let mut b = Builder::new();
+    let response = b.init_root(0, 2);
 
-    // Build the message in a scope so its borrow ends before serializing.
-    {
-        let mut response = message.init_root::<connect_response::Builder>();
+    if let Some(error) = error {
+        b.set_text(response.slot(0), error);
+    }
 
-        if let Some(error) = error {
-            response.set_error(error);
-        }
+    if !metadata.is_empty() {
+        let list = b.init_struct_list(response.slot(1), metadata.len(), 0, 2);
 
-        let mut list = response.init_metadata(metadata.len() as u32);
         for (i, (key, val)) in metadata.iter().enumerate() {
-            let mut entry = list.reborrow().get(i as u32);
-            entry.set_key(key);
-            entry.set_val(val);
+            b.set_text(list.get(i).slot(0), key);
+            b.set_text(list.get(i).slot(1), val);
         }
     }
 
-    let words = capnp::serialize::write_message_to_words(&message);
-    let mut out = Vec::with_capacity(DATA_SIGNATURE.len() + VERSION.len() + words.len());
+    let message = b.finish();
+    let mut out = Vec::with_capacity(DATA_SIGNATURE.len() + VERSION.len() + message.len());
     out.extend_from_slice(&DATA_SIGNATURE);
     out.extend_from_slice(&VERSION);
-    out.extend_from_slice(&words);
+    out.extend_from_slice(&message);
+
     out
 }
 
@@ -258,41 +260,54 @@ mod tests {
                 ("HttpHost", "h"),
             ],
         );
+
         assert_eq!(r.http_headers().collect::<Vec<_>>(), [("Accept", "*/*")]);
         assert_eq!(r.http_method(), Some("GET"));
         assert_eq!(r.http_host(), Some("h"));
     }
 
-    #[test]
-    fn response_round_trips() {
+    #[tokio::test]
+    async fn response_round_trips() {
         let bytes = response_bytes(Some("boom"), &[("HttpStatus", "502")]);
         assert_eq!(bytes[..6], DATA_SIGNATURE);
         assert_eq!(bytes[6..8], VERSION);
-        let message = capnp::serialize::read_message(&mut &bytes[8..], Default::default()).unwrap();
-        let root = message.get_root::<connect_response::Reader>().unwrap();
-        assert_eq!(root.get_error().unwrap().to_str().unwrap(), "boom");
-        let entry = root.get_metadata().unwrap().get(0);
-        assert_eq!(entry.get_key().unwrap().to_str().unwrap(), "HttpStatus");
-        assert_eq!(entry.get_val().unwrap().to_str().unwrap(), "502");
+
+        let message = wire::read_message(&mut &bytes[8..]).await.unwrap();
+        let root = message.root().unwrap();
+        assert_eq!(root.text(0).unwrap(), "boom");
+
+        let entry = root.struct_list(1).unwrap().get(0).unwrap();
+        assert_eq!(entry.text(0).unwrap(), "HttpStatus");
+        assert_eq!(entry.text(1).unwrap(), "502");
     }
 
-    #[test]
-    fn request_parses() {
-        let mut builder = capnp::message::Builder::new_default();
-        {
-            let mut root = builder.init_root::<connect_request::Builder>();
-            root.set_dest("https://h/p");
-            root.set_type(ConnectionType::Websocket);
-            let mut list = root.init_metadata(1);
-            let mut entry = list.reborrow().get(0);
-            entry.set_key("HttpMethod");
-            entry.set_val("GET");
-        }
-        let words = capnp::serialize::write_message_to_words(&builder);
-        let message = capnp::serialize::read_message(&mut &words[..], Default::default()).unwrap();
+    #[tokio::test]
+    async fn request_parses() {
+        let mut b = Builder::new();
+        let root = b.init_root(1, 2);
+        b.set_u16(root, 0, WEBSOCKET);
+        b.set_text(root.slot(0), "https://h/p");
+
+        let list = b.init_struct_list(root.slot(1), 1, 0, 2);
+        b.set_text(list.get(0).slot(0), "HttpMethod");
+        b.set_text(list.get(0).slot(1), "GET");
+
+        let message = wire::read_message(&mut &b.finish()[..]).await.unwrap();
         let parsed = parse_request(&message).unwrap();
+
         assert_eq!(parsed.dest, "https://h/p");
         assert_eq!(parsed.kind, StreamKind::WebSocket);
         assert_eq!(parsed.http_method(), Some("GET"));
+    }
+
+    #[tokio::test]
+    async fn an_unknown_connection_type_is_refused() {
+        let mut b = Builder::new();
+        let root = b.init_root(1, 2);
+        b.set_u16(root, 0, 9);
+
+        let message = wire::read_message(&mut &b.finish()[..]).await.unwrap();
+
+        assert!(parse_request(&message).is_err());
     }
 }

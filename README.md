@@ -23,8 +23,14 @@ for the wire protocol.
 Status: early. WebSocket, TCP and UDP streams are not handled yet, and the
 edge configuration pushed over RPC is ignored.
 
-Building needs the `capnp` compiler on the PATH (for example `brew install capnp`).
+Building needs only a Rust toolchain. The Cap'n Proto wire format is read and
+written by `src/wire.rs`, with no schema compiler and no C++.
+
+`cargo test` also compares that code with the reference `capnp` tool when it is
+on the PATH (for example `brew install capnp`), using the schemas in
+`tests/schema`. Without the tool, those tests skip.
 
 License: MIT OR Apache-2.0.
 
-The files in `schema/` and `roots/` come from `cloudflare/cloudflared` (Apache-2.0).
+The files in `tests/schema/` and `roots/` come from `cloudflare/cloudflared` and
+`capnproto/capnproto` (Apache-2.0 and MIT).

@@ -31,26 +31,8 @@ pub enum Error {
     Read(#[from] quinn::ReadExactError),
     #[error("stream write: {0}")]
     Write(#[from] quinn::WriteError),
-    #[error("control thread: {0}")]
+    #[error("I/O: {0}")]
     Io(#[from] std::io::Error),
-}
-
-impl From<capnp::Error> for Error {
-    fn from(e: capnp::Error) -> Self {
-        Error::Rpc(e.to_string())
-    }
-}
-
-impl From<capnp::NotInSchema> for Error {
-    fn from(e: capnp::NotInSchema) -> Self {
-        Error::Rpc(e.to_string())
-    }
-}
-
-impl From<std::str::Utf8Error> for Error {
-    fn from(e: std::str::Utf8Error) -> Self {
-        Error::Rpc(e.to_string())
-    }
 }
 
 impl Error {

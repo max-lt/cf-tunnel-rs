@@ -19,21 +19,16 @@
 //! ```
 
 mod client;
+mod control;
 mod edge;
 mod error;
+#[cfg(test)]
+mod interop_tests;
+mod proto;
 mod stream;
 mod token;
 mod tunnel;
-
-#[allow(clippy::all, dead_code)]
-mod tunnelrpc_capnp {
-    include!(concat!(env!("OUT_DIR"), "/tunnelrpc_capnp.rs"));
-}
-
-#[allow(clippy::all, dead_code)]
-mod quic_metadata_protocol_capnp {
-    include!(concat!(env!("OUT_DIR"), "/quic_metadata_protocol_capnp.rs"));
-}
+mod wire;
 
 pub use client::{ClientConfig, ConnectionDetails, TunnelClient};
 pub use error::Error;
