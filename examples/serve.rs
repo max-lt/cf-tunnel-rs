@@ -1,11 +1,15 @@
 //! Register one connection with the edge, then relay HTTP requests to ORIGIN.
-//! Usage: set -a; . ./.env; set +a; EDGE_ADDR=<ip>:7844 cargo run --example serve
+//! Usage: set -a; . ./.env; set +a; EDGE_ADDRS=<ip>:7844,<ip>:7844 cargo run --example serve
 
-use std::time::Duration;
+use std::{net::SocketAddr, sync::Arc, time::Duration};
 
 use anyhow::{Context, Result, bail};
 use cf_tunnel_rs::{ClientConfig, ConnectRequest, IncomingStream, StreamKind, TunnelClient};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    sync::watch,
+    task::JoinSet,
+};
 
 const GRACE: Duration = Duration::from_secs(3);
 /// Headers that describe the hop to the origin, not the request itself.
@@ -17,20 +21,45 @@ async fn main() -> Result<()> {
     let token = std::env::var("TUNNEL_TOKEN")
         .context("TUNNEL_TOKEN is not set")?
         .parse()?;
-    let edge = std::env::var("EDGE_ADDR")
-        .context("EDGE_ADDR is not set")?
-        .parse()?;
-    let origin = std::env::var("ORIGIN").unwrap_or_else(|_| "localhost:3000".into());
+    let edges = std::env::var("EDGE_ADDRS")
+        .context("EDGE_ADDRS is not set (comma-separated ip:port)")?
+        .split(',')
+        .map(str::parse)
+        .collect::<Result<Vec<SocketAddr>, _>>()?;
+    let origin: Arc<str> = std::env::var("ORIGIN")
+        .unwrap_or_else(|_| "localhost:3000".into())
+        .into();
 
-    let client = TunnelClient::connect(ClientConfig::new(token, edge)).await?;
-    let details = client.details();
-    eprintln!(
-        "registered: location={} remotely_managed={} uuid={}",
-        details.location, details.remotely_managed, details.uuid
-    );
+    // One config per connection. They share the client id of the first.
+    let base = ClientConfig::new(token, edges[0]);
+    let (stop_tx, stop_rx) = watch::channel(false);
+    let mut servers = JoinSet::new();
+    for (index, edge) in edges.into_iter().enumerate() {
+        let mut config = base.clone();
+        config.edge = edge;
+        config.conn_index = index as u8;
+        let client = TunnelClient::connect(config).await?;
+        let details = client.details();
+        eprintln!(
+            "conn {index} registered: location={} uuid={}",
+            details.location, details.uuid
+        );
+        servers.spawn(serve(client, origin.clone(), stop_rx.clone()));
+    }
     eprintln!("serving origin {origin}; Ctrl-C to stop");
 
-    let result = loop {
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {}
+        _ = servers.join_next() => eprintln!("a connection ended; stopping"),
+    }
+    stop_tx.send(true)?;
+    while servers.join_next().await.is_some() {}
+    Ok(())
+}
+
+/// Serves one connection until it fails or `stop` fires.
+async fn serve(client: TunnelClient, origin: Arc<str>, mut stop: watch::Receiver<bool>) {
+    loop {
         tokio::select! {
             stream = client.accept() => match stream {
                 Ok(stream) => {
@@ -41,13 +70,15 @@ async fn main() -> Result<()> {
                         }
                     });
                 }
-                Err(e) => break Err(e.into()),
+                Err(e) => {
+                    eprintln!("connection: {e}");
+                    break;
+                }
             },
-            _ = tokio::signal::ctrl_c() => break Ok(()),
+            _ = stop.changed() => break,
         }
-    };
+    }
     client.shutdown(GRACE).await;
-    result
 }
 
 async fn proxy(stream: IncomingStream, origin: &str) -> Result<()> {
